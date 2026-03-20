@@ -13,7 +13,7 @@
  * - pointer callback: reads timerfd, writes from mmap buffer to slave,
  *   advances hw_ptr (this is where actual I/O happens)
  * - poll: timerfd (pacing) + eventfd (space available signaling)
- * - silence thread: feeds zeros to slave when no client is active
+ * - silence thread: feeds -100dB noise to slave when no client is active
  *
  * Copyright (C) 2026 Just a Nerd
  * License: GPL-2.0-or-later
@@ -200,9 +200,8 @@ static int set_event(struct keepalive_data *kd, int force_on)
     if (!on) {
         switch (kd->io.state) {
         case SND_PCM_STATE_RUNNING:
-            on = kd->io.hw_ptr < 0 ? 1 :
-                snd_pcm_ioplug_avail(&kd->io, kd->io.hw_ptr,
-                                     kd->io.appl_ptr) >= kd->io.period_size;
+            on = snd_pcm_ioplug_avail(&kd->io, kd->io.hw_ptr,
+                                      kd->io.appl_ptr) >= kd->io.period_size;
             break;
         case SND_PCM_STATE_DRAINING:
             on = 0;
