@@ -10,7 +10,8 @@
 #   make CROSS_COMPILE=aarch64-linux-gnu-
 #
 # Dependencies (build host):
-#   libasound2-dev (or target-arch equivalent for cross-compile)
+#   Native: libasound2-dev
+#   Cross (Debian multiarch): libasound2-dev:<target-arch>
 #
 # Dependencies (target runtime):
 #   libasound2 (always present on Volumio)
@@ -26,15 +27,25 @@ CC       = $(CROSS_COMPILE)gcc
 STRIP    = $(CROSS_COMPILE)strip
 
 CFLAGS   = -Wall -Wextra -O2 -fPIC
-CFLAGS  += $(shell pkg-config --cflags alsa 2>/dev/null)
-
 LDFLAGS  = -shared -Wl,-soname,$(PLUGIN)
-LIBS     = $(shell pkg-config --libs alsa 2>/dev/null)
-LIBS    += -lpthread
+LIBS     = -lasound -lpthread
 
-# Fallback if pkg-config unavailable (cross-compile with manual sysroot)
-ifeq ($(filter -lasound,$(LIBS)),)
-LIBS    += -lasound
+ifdef CROSS_COMPILE
+  # Cross-compile: do NOT use host pkg-config (leaks host include paths).
+  # Derive target triple from CROSS_COMPILE (strip trailing hyphen).
+  #
+  # ALSA headers are symlinked into the cross sysroot by Dockerfile.
+  # The cross-gcc finds them there alongside target libc headers.
+  # We only need the library path for linking.
+  TARGET_TRIPLE := $(patsubst %-,%,$(CROSS_COMPILE))
+  LDFLAGS += -L/usr/lib/$(TARGET_TRIPLE)
+else
+  # Native build: use pkg-config if available
+  CFLAGS  += $(shell pkg-config --cflags alsa 2>/dev/null)
+  _PKGLIBS := $(shell pkg-config --libs alsa 2>/dev/null)
+  ifneq ($(_PKGLIBS),)
+    LIBS = $(_PKGLIBS) -lpthread
+  endif
 endif
 
 .PHONY: all clean strip install
