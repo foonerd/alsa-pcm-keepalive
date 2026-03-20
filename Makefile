@@ -26,7 +26,13 @@ SRC      = libasound_module_pcm_keepalive.c
 CC       = $(CROSS_COMPILE)gcc
 STRIP    = $(CROSS_COMPILE)strip
 
-CFLAGS   = -Wall -Wextra -O2 -fPIC
+# -DPIC selects the dynamic-build path in ALSA's global.h for
+# SND_PCM_PLUGIN_SYMBOL(). Without it, the macro generates a
+# static-build linked-list entry referencing snd_dlsym_start,
+# which is absent from Volumio's RPi-patched libasound2.
+# Matches Volumio's own volumioswitch CMakeLists.txt:
+#   add_definitions(-DPIC)
+CFLAGS   = -Wall -Wextra -O2 -fPIC -DPIC
 LDFLAGS  = -shared -Wl,-soname,$(PLUGIN)
 LIBS     = -lasound -lpthread
 
