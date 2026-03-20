@@ -15,7 +15,7 @@
  *
  *   pcm.keepaliveProxy {
  *       type keepalive
- *       slave.pcm "volumioOutput"
+ *       slave.pcm "downstream"
  *   }
  */
 
@@ -50,13 +50,16 @@ static inline void eventfd_consume(int fd)
 /* --------------------------------------------------------------------------
  * Persistent state
  *
- * Survives close/reopen cycles. When the upstream client closes, the
- * slave PCM stays open here. The next client instance reclaims it
- * without a gap. The hardware buffer bridges the transition.
+ * Survives close/reopen cycles. The slave PCM and the silence thread
+ * live here. When the upstream client closes, both persist. The next
+ * client instance reclaims the slave without any gap in the audio
+ * stream - the silence thread keeps feeding frames throughout.
  * -------------------------------------------------------------------------- */
 
 static struct keepalive_persist {
     pthread_mutex_t     lock;
+
+    /* slave connection */
     snd_pcm_t          *slave;
     char                slave_name[256];
     unsigned int        rate;
@@ -65,8 +68,23 @@ static struct keepalive_persist {
     snd_pcm_uframes_t   period_size;
     snd_pcm_uframes_t   buffer_size;
     int                 configured;     /* 1 = slave has valid hw_params */
+
+    /* silence thread - persistent across instance close/reopen */
+    pthread_t           thread;
+    pthread_mutex_t     thread_mtx;
+    pthread_cond_t      thread_cond;
+    int                 thread_running; /* 1 = thread exists */
+    int                 active;         /* 1 = instance writing audio */
+    int                 in_write;       /* 1 = silence write in progress */
+
+    /* silence buffer */
+    char               *silence_buf;
+    snd_pcm_uframes_t   silence_frames;
+    unsigned int        frame_bytes;
 } persist = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
+    .thread_mtx = PTHREAD_MUTEX_INITIALIZER,
+    .thread_cond = PTHREAD_COND_INITIALIZER,
 };
 
 /* --------------------------------------------------------------------------
@@ -82,63 +100,51 @@ struct keepalive_data {
 
     /* pointer tracking */
     snd_pcm_uframes_t   hw_ptr;
-
-    /* silence thread */
-    pthread_t           thread;
-    pthread_mutex_t     mtx;
-    pthread_cond_t      cond;
-    int                 active;         /* 1 = audio passthrough mode */
-    int                 in_write;       /* 1 = silence thread mid-write */
-    int                 thread_run;     /* 0 = thread should exit */
-
-    /* silence buffer */
-    char               *silence_buf;
-    snd_pcm_uframes_t   silence_frames;
-    unsigned int        frame_bytes;
+    unsigned int        frame_bytes;    /* cached for transfer offset calc */
 };
 
 /* --------------------------------------------------------------------------
- * Silence thread
+ * Silence thread (persistent)
  *
- * Writes zero frames to the slave when the upstream client is not
+ * Writes zero frames to the slave when no upstream instance is
  * actively playing. Feeds one period at a time, sleeps in between.
- * Pauses when active=1 (upstream writing) and resumes when active=0.
+ * Pauses when active=1 and resumes when active=0.
+ *
+ * This thread is created on first use and runs until the process
+ * exits. It survives instance close/reopen cycles, ensuring the
+ * slave device always receives frames.
  * -------------------------------------------------------------------------- */
 
 static void *silence_thread_fn(void *arg)
 {
-    struct keepalive_data *kd = arg;
     snd_pcm_t *slave;
     snd_pcm_sframes_t ret;
 
+    (void)arg;
+
     while (1) {
-        pthread_mutex_lock(&kd->mtx);
+        pthread_mutex_lock(&persist.thread_mtx);
 
-        /* wait while upstream is active or until shutdown */
-        while (kd->active && kd->thread_run)
-            pthread_cond_wait(&kd->cond, &kd->mtx);
-
-        if (!kd->thread_run) {
-            pthread_mutex_unlock(&kd->mtx);
-            break;
-        }
+        /* wait while an instance is actively writing audio */
+        while (persist.active)
+            pthread_cond_wait(&persist.thread_cond, &persist.thread_mtx);
 
         /* mark that we are about to write */
-        kd->in_write = 1;
-        pthread_mutex_unlock(&kd->mtx);
+        persist.in_write = 1;
+        pthread_mutex_unlock(&persist.thread_mtx);
 
         /* write one period of silence to the slave */
         pthread_mutex_lock(&persist.lock);
         slave = persist.slave;
         pthread_mutex_unlock(&persist.lock);
 
-        if (slave && kd->silence_buf) {
-            ret = snd_pcm_writei(slave, kd->silence_buf,
-                                 kd->silence_frames);
+        if (slave && persist.silence_buf) {
+            ret = snd_pcm_writei(slave, persist.silence_buf,
+                                 persist.silence_frames);
             if (ret == -EPIPE) {
                 snd_pcm_prepare(slave);
-                snd_pcm_writei(slave, kd->silence_buf,
-                               kd->silence_frames);
+                snd_pcm_writei(slave, persist.silence_buf,
+                               persist.silence_frames);
             } else if (ret == -ESTRPIPE) {
                 /* suspended - wait for resume */
                 while (snd_pcm_resume(slave) == -EAGAIN)
@@ -148,22 +154,37 @@ static void *silence_thread_fn(void *arg)
         }
 
         /* clear write flag, wake anyone waiting in start callback */
-        pthread_mutex_lock(&kd->mtx);
-        kd->in_write = 0;
-        pthread_cond_signal(&kd->cond);
-        pthread_mutex_unlock(&kd->mtx);
+        pthread_mutex_lock(&persist.thread_mtx);
+        persist.in_write = 0;
+        pthread_cond_broadcast(&persist.thread_cond);
+        pthread_mutex_unlock(&persist.thread_mtx);
 
         /* sleep for roughly half a period to avoid busy-loop.
          * the exact timing is not critical - the slave's own
          * buffer provides the flow control. */
-        if (kd->silence_frames && kd->io.rate)
-            usleep((unsigned long)kd->silence_frames * 500000
-                   / kd->io.rate);
+        if (persist.silence_frames && persist.rate)
+            usleep((unsigned long)persist.silence_frames * 500000
+                   / persist.rate);
         else
             usleep(10000);
     }
 
     return NULL;
+}
+
+/* start the persistent silence thread if not already running */
+static void ensure_silence_thread(void)
+{
+    pthread_mutex_lock(&persist.thread_mtx);
+    if (!persist.thread_running) {
+        persist.active = 0;
+        persist.in_write = 0;
+        if (pthread_create(&persist.thread, NULL,
+                           silence_thread_fn, NULL) == 0) {
+            persist.thread_running = 1;
+        }
+    }
+    pthread_mutex_unlock(&persist.thread_mtx);
 }
 
 /* --------------------------------------------------------------------------
@@ -176,10 +197,18 @@ static int open_slave(struct keepalive_data *kd)
     snd_pcm_hw_params_t *hw;
     int err;
 
+    /* pause silence thread while we reconfigure the slave */
+    pthread_mutex_lock(&persist.thread_mtx);
+    persist.active = 1;
+    pthread_cond_broadcast(&persist.thread_cond);
+    while (persist.in_write)
+        pthread_cond_wait(&persist.thread_cond, &persist.thread_mtx);
+    pthread_mutex_unlock(&persist.thread_mtx);
+
     err = snd_pcm_open(&pcm, kd->slave_name,
                         SND_PCM_STREAM_PLAYBACK, 0);
     if (err < 0)
-        return err;
+        goto resume_silence;
 
     snd_pcm_hw_params_alloca(&hw);
     snd_pcm_hw_params_any(pcm, hw);
@@ -208,7 +237,7 @@ static int open_slave(struct keepalive_data *kd)
     err = snd_pcm_prepare(pcm);
     if (err < 0) goto fail;
 
-    /* store in persistent state */
+    /* update persistent state */
     pthread_mutex_lock(&persist.lock);
 
     if (persist.slave) {
@@ -226,11 +255,34 @@ static int open_slave(struct keepalive_data *kd)
     snprintf(persist.slave_name, sizeof(persist.slave_name),
              "%s", kd->slave_name);
 
+    /* reallocate silence buffer for new format */
+    {
+        unsigned int fb = (snd_pcm_format_physical_width(kd->io.format) / 8)
+                          * kd->io.channels;
+        free(persist.silence_buf);
+        persist.silence_buf = calloc(period, fb);
+        persist.silence_frames = period;
+        persist.frame_bytes = fb;
+    }
+
     pthread_mutex_unlock(&persist.lock);
+
+    /* resume silence thread feeding with new format */
+    pthread_mutex_lock(&persist.thread_mtx);
+    persist.active = 0;
+    pthread_cond_broadcast(&persist.thread_cond);
+    pthread_mutex_unlock(&persist.thread_mtx);
+
     return 0;
 
 fail:
     snd_pcm_close(pcm);
+resume_silence:
+    /* resume silence on failure */
+    pthread_mutex_lock(&persist.thread_mtx);
+    persist.active = 0;
+    pthread_cond_broadcast(&persist.thread_cond);
+    pthread_mutex_unlock(&persist.thread_mtx);
     return err;
 }
 
@@ -253,37 +305,6 @@ static int slave_matches(struct keepalive_data *kd)
 }
 
 /* --------------------------------------------------------------------------
- * Silence buffer management
- * -------------------------------------------------------------------------- */
-
-static int alloc_silence(struct keepalive_data *kd)
-{
-    unsigned int frame_bytes;
-    snd_pcm_uframes_t frames;
-
-    frame_bytes = (snd_pcm_format_physical_width(kd->io.format) / 8)
-                  * kd->io.channels;
-
-    pthread_mutex_lock(&persist.lock);
-    frames = persist.period_size;
-    pthread_mutex_unlock(&persist.lock);
-
-    if (!frames)
-        frames = 1024; /* fallback */
-
-    free(kd->silence_buf);
-    kd->silence_buf = calloc(frames, frame_bytes);
-    if (!kd->silence_buf)
-        return -ENOMEM;
-
-    kd->silence_frames = frames;
-    kd->frame_bytes    = frame_bytes;
-
-    /* buffer is zeroed by calloc - silence */
-    return 0;
-}
-
-/* --------------------------------------------------------------------------
  * ioplug callbacks
  * -------------------------------------------------------------------------- */
 
@@ -295,17 +316,18 @@ static int keepalive_hw_params(snd_pcm_ioplug_t *io,
 
     (void)params;
 
-    /* open or reconfigure the slave */
+    /* open or reconfigure the slave if format changed */
     if (!slave_matches(kd)) {
         err = open_slave(kd);
         if (err < 0)
             return err;
     }
 
-    /* allocate silence buffer matching current format */
-    err = alloc_silence(kd);
-    if (err < 0)
-        return err;
+    /* cache frame_bytes for transfer offset calculation */
+    kd->frame_bytes = persist.frame_bytes;
+
+    /* ensure the persistent silence thread is running */
+    ensure_silence_thread();
 
     return 0;
 }
@@ -322,19 +344,6 @@ static int keepalive_prepare(snd_pcm_ioplug_t *io)
         snd_pcm_prepare(persist.slave);
     pthread_mutex_unlock(&persist.lock);
 
-    /* start silence thread if not running */
-    if (!kd->thread_run) {
-        kd->active     = 0;  /* start in silence mode */
-        kd->in_write   = 0;
-        kd->thread_run = 1;
-
-        if (pthread_create(&kd->thread, NULL,
-                           silence_thread_fn, kd) != 0) {
-            kd->thread_run = 0;
-            return -ENOMEM;
-        }
-    }
-
     return 0;
 }
 
@@ -342,16 +351,18 @@ static int keepalive_start(snd_pcm_ioplug_t *io)
 {
     struct keepalive_data *kd = io->private_data;
 
+    (void)kd;
+
     /* switch to audio passthrough: pause the silence thread */
-    pthread_mutex_lock(&kd->mtx);
-    kd->active = 1;
-    pthread_cond_signal(&kd->cond);
+    pthread_mutex_lock(&persist.thread_mtx);
+    persist.active = 1;
+    pthread_cond_broadcast(&persist.thread_cond);
 
     /* wait for any in-progress silence write to finish */
-    while (kd->in_write)
-        pthread_cond_wait(&kd->cond, &kd->mtx);
+    while (persist.in_write)
+        pthread_cond_wait(&persist.thread_cond, &persist.thread_mtx);
 
-    pthread_mutex_unlock(&kd->mtx);
+    pthread_mutex_unlock(&persist.thread_mtx);
 
     /* signal eventfd so framework starts calling transfer */
     eventfd_signal(kd->event_fd);
@@ -361,13 +372,13 @@ static int keepalive_start(snd_pcm_ioplug_t *io)
 
 static int keepalive_stop(snd_pcm_ioplug_t *io)
 {
-    struct keepalive_data *kd = io->private_data;
+    (void)io;
 
     /* switch to silence mode: resume the silence thread */
-    pthread_mutex_lock(&kd->mtx);
-    kd->active = 0;
-    pthread_cond_signal(&kd->cond);
-    pthread_mutex_unlock(&kd->mtx);
+    pthread_mutex_lock(&persist.thread_mtx);
+    persist.active = 0;
+    pthread_cond_broadcast(&persist.thread_cond);
+    pthread_mutex_unlock(&persist.thread_mtx);
 
     return 0;
 }
@@ -381,10 +392,7 @@ static snd_pcm_sframes_t keepalive_transfer(snd_pcm_ioplug_t *io,
     snd_pcm_t *slave;
     snd_pcm_sframes_t ret;
 
-    /* calculate pointer to audio data in the ioplug mmap buffer.
-     * for interleaved access, areas[0].addr is the buffer base,
-     * areas[0].first is the bit offset to channel 0 sample,
-     * and step is frame size in bits. */
+    /* calculate pointer to audio data in the ioplug mmap buffer */
     const char *buf = (const char *)areas[0].addr
                     + (areas[0].first / 8)
                     + (offset * kd->frame_bytes);
@@ -405,7 +413,6 @@ static snd_pcm_sframes_t keepalive_transfer(snd_pcm_ioplug_t *io,
 
     if (ret > 0) {
         kd->hw_ptr += ret;
-        /* signal eventfd: ready for more data */
         eventfd_signal(kd->event_fd);
     }
 
@@ -420,7 +427,7 @@ static snd_pcm_sframes_t keepalive_pointer(snd_pcm_ioplug_t *io)
 
 static int keepalive_drain(snd_pcm_ioplug_t *io)
 {
-    struct keepalive_data *kd = io->private_data;
+    (void)io;
 
     /* drain remaining audio from the slave, then switch to silence */
     pthread_mutex_lock(&persist.lock);
@@ -435,10 +442,10 @@ static int keepalive_drain(snd_pcm_ioplug_t *io)
     pthread_mutex_unlock(&persist.lock);
 
     /* resume silence */
-    pthread_mutex_lock(&kd->mtx);
-    kd->active = 0;
-    pthread_cond_signal(&kd->cond);
-    pthread_mutex_unlock(&kd->mtx);
+    pthread_mutex_lock(&persist.thread_mtx);
+    persist.active = 0;
+    pthread_cond_broadcast(&persist.thread_cond);
+    pthread_mutex_unlock(&persist.thread_mtx);
 
     return 0;
 }
@@ -447,27 +454,17 @@ static int keepalive_close(snd_pcm_ioplug_t *io)
 {
     struct keepalive_data *kd = io->private_data;
 
-    /* stop the silence thread */
-    if (kd->thread_run) {
-        pthread_mutex_lock(&kd->mtx);
-        kd->thread_run = 0;
-        kd->active     = 0;
-        pthread_cond_signal(&kd->cond);
-        pthread_mutex_unlock(&kd->mtx);
-
-        pthread_join(kd->thread, NULL);
-    }
-
-    /* do NOT close persist.slave - it stays open for the next
-     * instance. the hardware buffer bridges the gap. */
-
-    pthread_mutex_destroy(&kd->mtx);
-    pthread_cond_destroy(&kd->cond);
+    /* resume silence thread if this instance was active.
+     * do NOT stop the thread - it persists across instances.
+     * do NOT close the slave - it persists across instances. */
+    pthread_mutex_lock(&persist.thread_mtx);
+    persist.active = 0;
+    pthread_cond_broadcast(&persist.thread_cond);
+    pthread_mutex_unlock(&persist.thread_mtx);
 
     if (kd->event_fd >= 0)
         close(kd->event_fd);
 
-    free(kd->silence_buf);
     free(kd->slave_name);
     free(kd);
 
@@ -609,13 +606,6 @@ SND_PCM_PLUGIN_DEFINE_FUNC(keepalive)
         return err;
     }
 
-    /* threading primitives */
-    pthread_mutex_init(&kd->mtx, NULL);
-    pthread_cond_init(&kd->cond, NULL);
-    kd->active     = 0;
-    kd->in_write   = 0;
-    kd->thread_run = 0;
-
     /* create the ioplug */
     kd->io.version  = SND_PCM_IOPLUG_VERSION;
     kd->io.name     = "ALSA keepalive proxy";
@@ -628,16 +618,12 @@ SND_PCM_PLUGIN_DEFINE_FUNC(keepalive)
     err = snd_pcm_ioplug_create(&kd->io, name, stream, mode);
     if (err < 0) {
         close(kd->event_fd);
-        pthread_mutex_destroy(&kd->mtx);
-        pthread_cond_destroy(&kd->cond);
         free(kd->slave_name);
         free(kd);
         return err;
     }
 
-    /* set hardware parameter constraints.
-     * we accept any format/rate/channels that the slave accepts.
-     * the actual constraint comes from the slave in hw_params. */
+    /* set hardware parameter constraints */
     snd_pcm_ioplug_set_param_minmax(&kd->io,
         SND_PCM_IOPLUG_HW_CHANNELS, 1, 8);
     snd_pcm_ioplug_set_param_minmax(&kd->io,
