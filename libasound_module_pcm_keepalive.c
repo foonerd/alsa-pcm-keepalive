@@ -119,7 +119,10 @@ static void *silence_thread_fn(void *arg)
         if (slave && persist.silence_buf) {
             ret = snd_pcm_writei(slave, persist.silence_buf,
                                  persist.silence_frames);
-            if (ret == -EPIPE) {
+            if (ret == -EAGAIN) {
+                /* nonblock device buffer full - normal on HDMI/iec958,
+                 * just skip this cycle and retry next iteration */
+            } else if (ret == -EPIPE) {
                 snd_pcm_prepare(slave);
                 snd_pcm_writei(slave, persist.silence_buf,
                                persist.silence_frames);
@@ -430,18 +433,28 @@ static snd_pcm_sframes_t write_to_slave(snd_pcm_ioplug_t *io,
 
         loop_written = snd_pcm_writei(slave, buf, target_size);
 
-        if (loop_written <= 0)
+        if (loop_written == -EAGAIN) {
+            /* nonblock device buffer full - return what we have so far.
+             * pointer callback will advance hw_ptr by partial amount,
+             * next timer tick will pick up the rest. */
             break;
+        } else if (loop_written == -EPIPE) {
+            snd_pcm_prepare(slave);
+            loop_written = snd_pcm_writei(slave, buf, target_size);
+            if (loop_written <= 0)
+                break;
+        } else if (loop_written <= 0) {
+            break;
+        }
 
         written += loop_written;
         offset = (offset + loop_written) % io->buffer_size;
         remaining = io->buffer_size - offset;
     }
 
-    if (written != (snd_pcm_sframes_t)size)
-        return -EPIPE;
-
-    return written;
+    /* partial writes are OK - return what was written.
+     * only return error if nothing was written at all. */
+    return written > 0 ? written : -EPIPE;
 }
 
 /* --------------------------------------------------------------------------
@@ -471,11 +484,25 @@ static int keepalive_prepare(snd_pcm_ioplug_t *io)
 {
     (void)io;
 
+    /* pause silence thread before touching the slave.
+     * prepare is called BEFORE start, so the silence thread
+     * may still be running. calling snd_pcm_prepare on the slave
+     * while the silence thread is mid-write corrupts the device
+     * state on HDMI/iec958 outputs. */
+    pthread_mutex_lock(&persist.thread_mtx);
+    persist.active = 1;
+    pthread_cond_broadcast(&persist.thread_cond);
+    while (persist.in_write)
+        pthread_cond_wait(&persist.thread_cond, &persist.thread_mtx);
+    pthread_mutex_unlock(&persist.thread_mtx);
+
     pthread_mutex_lock(&persist.lock);
     if (persist.slave)
         snd_pcm_prepare(persist.slave);
     pthread_mutex_unlock(&persist.lock);
 
+    /* leave silence thread paused - start will keep it paused,
+     * close/stop will resume it */
     return 0;
 }
 
