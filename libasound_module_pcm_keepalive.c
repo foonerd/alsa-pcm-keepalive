@@ -336,6 +336,20 @@ static int open_slave(struct keepalive_data *kd)
     snd_pcm_hw_params_get_period_size(hw, &period, NULL);
     snd_pcm_hw_params_get_buffer_size(hw, &buffer);
 
+    /* set start_threshold to one period so the slave begins output
+     * immediately after the first period is written. the default
+     * start_threshold equals the full buffer size, which means the
+     * timerfd-paced pointer callback must fill the entire buffer
+     * before any audio comes out - causing 2-5 seconds of stutter
+     * on playback start, track change, and seek. */
+    {
+        snd_pcm_sw_params_t *sw;
+        snd_pcm_sw_params_alloca(&sw);
+        snd_pcm_sw_params_current(pcm, sw);
+        snd_pcm_sw_params_set_start_threshold(pcm, sw, period);
+        snd_pcm_sw_params(pcm, sw);
+    }
+
     err = snd_pcm_prepare(pcm);
     if (err < 0) goto fail;
 
@@ -534,17 +548,17 @@ static int keepalive_stop(snd_pcm_ioplug_t *io)
     set_timer(kd, 0);
     set_event(kd, 1);
 
-    /* drop slave to clear buffers */
-    pthread_mutex_lock(&persist.lock);
-    if (persist.slave)
-        snd_pcm_drop(persist.slave);
-    pthread_mutex_unlock(&persist.lock);
-
-    /* prepare slave for silence thread */
-    pthread_mutex_lock(&persist.lock);
-    if (persist.slave)
-        snd_pcm_prepare(persist.slave);
-    pthread_mutex_unlock(&persist.lock);
+    /* do NOT drop or prepare the slave here. the slave stays in
+     * RUNNING state. the silence thread resumes and continues
+     * feeding noise to the already-running device. this avoids
+     * emptying the hardware buffer on every stop/start cycle
+     * (track change, seek, skip) which caused audible stutter
+     * during the refill period.
+     *
+     * for format changes (different rate/channels), open_slave
+     * handles drop/close/reopen. keepalive_prepare handles
+     * snd_pcm_prepare when the ioplug framework calls it before
+     * the next start. */
 
     /* resume silence thread */
     pthread_mutex_lock(&persist.thread_mtx);
@@ -615,9 +629,16 @@ static snd_pcm_sframes_t keepalive_pointer(snd_pcm_ioplug_t *io)
             slave_state != SND_PCM_STATE_RUNNING)
             return -EPIPE;
 
-        snd_pcm_sframes_t to_copy = target_period * ((timer_val / 2) + 1);
-        while (to_copy > buffered || to_copy > target_avail)
-            to_copy -= target_period;
+        /* write as much as possible: minimum of buffered data and
+         * slave space, rounded down to period boundaries. the timer
+         * serves as a wake-up mechanism, not a rate limiter. the
+         * slave's own NONBLOCK/EAGAIN provides flow control.
+         * this eliminates the 1-2 second stutter on start/seek/track
+         * change caused by the old formula writing only one period
+         * per timer tick during initial buffer fill. */
+        snd_pcm_sframes_t to_copy = buffered < target_avail
+                                  ? buffered : target_avail;
+        to_copy -= to_copy % target_period;
 
         if (to_copy > 0) {
             moved = write_to_slave(io, 0, to_copy);
