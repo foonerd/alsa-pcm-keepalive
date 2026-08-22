@@ -34,4 +34,5 @@ RUN ln -s /usr/include/alsa /usr/arm-linux-gnueabihf/include/alsa && \
     ln -s /usr/include/alsa /usr/aarch64-linux-gnu/include/alsa
 
 WORKDIR /build
-COPY libasound_module_pcm_keepalive.c Makefile ./
+COPY keepalive.h keepalive_common.c keepalive_daemon.c \
+     libasound_module_pcm_keepalive.c Makefile ./

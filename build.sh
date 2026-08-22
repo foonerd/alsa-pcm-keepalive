@@ -1,9 +1,9 @@
 #!/bin/bash
 #
-# build.sh - Cross-compile ALSA keepalive proxy for all Volumio targets
+# build.sh - Cross-compile keepalive daemon + ALSA client for Volumio targets
 #
-# Builds armhf (Raspberry Pi), arm64, and amd64 binaries using Docker.
-# Output: dist/ directory with architecture-suffixed .so files.
+# Builds armhf (Raspberry Pi 32-bit), arm64, and amd64 binaries using Docker.
+# Output: dist/<arch>/ with the .so and the daemon.
 #
 # Usage:
 #   ./build.sh          Build all architectures
@@ -16,6 +16,7 @@ set -e
 
 IMAGE_NAME="alsa-keepalive-builder"
 PLUGIN="libasound_module_pcm_keepalive.so"
+DAEMON="audio-keepalive-daemon"
 
 TARGET="${1:-all}"
 
@@ -45,12 +46,13 @@ build_arch() {
         bash -c "
             make clean && \
             make ${cross_arg} && \
-            ${strip_cmd} ${PLUGIN} && \
-            cp ${PLUGIN} /dist/${PLUGIN}.${arch}
+            ${strip_cmd} ${PLUGIN} ${DAEMON} && \
+            mkdir -p /dist/${arch} && \
+            cp ${PLUGIN} ${DAEMON} /dist/${arch}/
         "
 
-    echo "  Built: dist/${PLUGIN}.${arch}"
-    file "dist/${PLUGIN}.${arch}"
+    echo "  Built: dist/${arch}/"
+    file "dist/${arch}/${PLUGIN}" "dist/${arch}/${DAEMON}"
 }
 
 case "${TARGET}" in
@@ -77,4 +79,4 @@ esac
 
 echo ""
 echo "=== Build complete ==="
-ls -la dist/
+ls -la dist/*/

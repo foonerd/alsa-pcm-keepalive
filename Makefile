@@ -1,4 +1,4 @@
-# libasound_module_pcm_keepalive - Makefile
+# audio-keepalive — daemon + thin ALSA PCM client
 #
 # Native build:
 #   make
@@ -16,57 +16,54 @@
 # Dependencies (target runtime):
 #   libasound2 (always present on Volumio)
 #
-# Install (target):
-#   make install DESTDIR=/usr/lib/arm-linux-gnueabihf
-#
 
-PLUGIN   = libasound_module_pcm_keepalive.so
-SRC      = libasound_module_pcm_keepalive.c
+PLUGIN      = libasound_module_pcm_keepalive.so
+DAEMON      = audio-keepalive-daemon
+COMMON_SRC  = keepalive_common.c
+PLUGIN_SRC  = libasound_module_pcm_keepalive.c $(COMMON_SRC)
+DAEMON_SRC  = keepalive_daemon.c $(COMMON_SRC)
 
-CC       = $(CROSS_COMPILE)gcc
-STRIP    = $(CROSS_COMPILE)strip
+CC          = $(CROSS_COMPILE)gcc
+STRIP       = $(CROSS_COMPILE)strip
 
 # -DPIC selects the dynamic-build path in ALSA's global.h for
 # SND_PCM_PLUGIN_SYMBOL(). Without it, the macro generates a
 # static-build linked-list entry referencing snd_dlsym_start,
 # which is absent from Volumio's RPi-patched libasound2.
-# Matches Volumio's own volumioswitch CMakeLists.txt:
-#   add_definitions(-DPIC)
-CFLAGS   = -Wall -Wextra -O2 -fPIC -DPIC
-LDFLAGS  = -shared -Wl,-soname,$(PLUGIN)
-LIBS     = -lasound -lpthread
+CFLAGS      = -Wall -Wextra -O2 -fPIC -DPIC
+PLUGIN_LDFLAGS = -shared -Wl,-soname,$(PLUGIN)
+LIBS        = -lasound -lpthread -lm
 
 ifdef CROSS_COMPILE
-  # Cross-compile: do NOT use host pkg-config (leaks host include paths).
-  # Derive target triple from CROSS_COMPILE (strip trailing hyphen).
-  #
-  # ALSA headers are symlinked into the cross sysroot by Dockerfile.
-  # The cross-gcc finds them there alongside target libc headers.
-  # We only need the library path for linking.
   TARGET_TRIPLE := $(patsubst %-,%,$(CROSS_COMPILE))
-  LDFLAGS += -L/usr/lib/$(TARGET_TRIPLE)
+  PLUGIN_LDFLAGS += -L/usr/lib/$(TARGET_TRIPLE)
+  DAEMON_LDFLAGS += -L/usr/lib/$(TARGET_TRIPLE)
 else
-  # Native build: use pkg-config if available
   CFLAGS  += $(shell pkg-config --cflags alsa 2>/dev/null)
   _PKGLIBS := $(shell pkg-config --libs alsa 2>/dev/null)
   ifneq ($(_PKGLIBS),)
-    LIBS = $(_PKGLIBS) -lpthread
+    LIBS = $(_PKGLIBS) -lpthread -lm
   endif
 endif
 
 .PHONY: all clean strip install
 
-all: $(PLUGIN)
+all: $(PLUGIN) $(DAEMON)
 
-$(PLUGIN): $(SRC)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LIBS)
+$(PLUGIN): $(PLUGIN_SRC) keepalive.h
+	$(CC) $(CFLAGS) $(PLUGIN_LDFLAGS) -o $@ $(PLUGIN_SRC) $(LIBS)
 
-strip: $(PLUGIN)
-	$(STRIP) $(PLUGIN)
+$(DAEMON): $(DAEMON_SRC) keepalive.h
+	$(CC) $(CFLAGS) $(DAEMON_LDFLAGS) -o $@ $(DAEMON_SRC) $(LIBS)
+
+strip: $(PLUGIN) $(DAEMON)
+	$(STRIP) $(PLUGIN) $(DAEMON)
 
 clean:
-	rm -f $(PLUGIN)
+	rm -f $(PLUGIN) $(DAEMON)
 
-install: $(PLUGIN)
+install: $(PLUGIN) $(DAEMON)
 	install -d $(DESTDIR)/alsa-lib
 	install -m 0644 $(PLUGIN) $(DESTDIR)/alsa-lib/$(PLUGIN)
+	install -d $(DESTDIR)/bin
+	install -m 0755 $(DAEMON) $(DESTDIR)/bin/$(DAEMON)

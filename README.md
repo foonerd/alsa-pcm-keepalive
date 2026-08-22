@@ -1,92 +1,63 @@
 # alsa-pcm-keepalive
 
-ALSA external plugin that prevents audio signal loss on HDMI, SPDIF,
-and USB outputs by maintaining continuous PCM output during idle.
+Keeps HDMI, SPDIF, and USB outputs locked by writing a continuous PCM
+stream. A small daemon owns the hardware. Players write into a thin
+virtual ALSA PCM that is mixed with inaudible (-100 dB) Gaussian noise.
 
-When no audio is playing, the plugin feeds silence to the downstream
-device. The hardware never sees the stream stop. Receivers, soundbars,
-and DACs maintain signal lock permanently.
+There is no volume control and no silence/passthrough switch.
 
 
 ## The problem
 
-Digital audio receivers (AVRs, soundbars, HDMI TVs, SPDIF decoders)
-detect signal presence by monitoring incoming audio frames. When a
-music player stops or pauses, the ALSA PCM stream closes and audio
-frames cease. The receiver detects the loss and drops its audio link.
+Digital receivers detect signal presence from incoming audio frames.
+When a player stops, ALSA closes the PCM and frames cease. The receiver
+drops the link and re-negotiates on the next play — often 1–5 seconds
+of silence, worst on HDMI.
 
-When playback resumes, the receiver must re-negotiate the connection.
-This produces 1-5 seconds of silence at the start of every track,
-after every pause, and on every stop/play cycle. The delay varies
-by receiver model and is especially severe on HDMI, where audio
-info frame negotiation adds overhead.
-
-Kodi solved this years ago with a dedicated silence injection layer
-in their audio engine (ActiveAESink). This plugin provides the same
-functionality as a reusable ALSA component that works with any
-application - MPD, GStreamer, PipeWire's ALSA backend, or anything
-else that outputs through ALSA.
+An inline ALSA plugin that *switches* between a silence thread and the
+player cannot do this reliably on Volumio: the plugin is loaded into
+whatever process opened the device, persist state dies with that
+process, and two writers sharing one IEC958/USB handle race.
 
 
 ## How it works
 
-The plugin is an ALSA ioplug that sits inline in the PCM chain
-between the application and the output device:
+    Players --> pcm.volumio --> other contributions
+            --> keepalive virtual PCM --> daemon
+                                        ^
+                         -100 dB noise -+
+                                        v
+                               keepaliveProxyOut --> hw
 
-    Application --> keepalive --> downstream device (hw, iec958, plug, etc.)
+The daemon is the only writer on the output device. It always emits
+noise. When a player is active, music is mixed in. Mute and volume sit
+upstream, so they never drop the hardware lock.
 
-When the application writes audio, the plugin passes it through
-unchanged. Zero processing, zero resampling, zero quality impact.
-
-When the application stops or closes, the plugin feeds silence
-frames to the downstream device. The PCM stream stays in RUNNING
-state. Audio info frames continue. The receiver maintains lock.
-
-When the application reopens and plays again, the plugin switches
-back to passthrough. The transition is seamless within the hardware
-buffer window (typically 50-500ms depending on configuration).
-
-The downstream device connection persists across application
-close/reopen cycles. The hardware never sees a gap unless the
-audio format (sample rate, bit depth, channels) changes between
-tracks.
-
-
-## Use cases
-
-- HDMI output to AVR/soundbar: eliminates re-negotiation delay on
-  every play/stop cycle
-- SPDIF output to external DAC: prevents receiver unlock/relock
-- USB DAC: prevents DAC standby mode during brief pauses
-- Any digital output where signal continuity matters
+Format follows the last client (bit-perfect while playing). Idle keeps
+that format. The hardware is reopened only when rate, bit depth, or
+channel count changes.
 
 
 ## Configuration
 
-Add to /etc/asound.conf or ~/.asoundrc:
+Volumio's modular ALSA pipeline wires the contribution automatically.
+Standalone /etc/asound.conf equivalent:
 
-    pcm.keepalive_out {
+    pcm.keepaliveProxy {
         type keepalive
+        socket "/run/audio-keepalive/ctl.sock"
+    }
+
+    pcm.keepaliveProxyOut {
+        type plug
         slave.pcm "hw:0,0"
     }
 
-Then point your application at "keepalive_out" instead of the
-hardware device directly.
+Start the daemon before any player:
 
-For more complex chains (e.g. with softvol or iec958 wrapping),
-insert the keepalive plugin at the appropriate point:
+    audio-keepalive-daemon --pcm keepaliveProxyOut --fallback-pcm hw:0,0
 
-    # example: keepalive before iec958 wrapper for HDMI
-    pcm.keepalive_hdmi {
-        type keepalive
-        slave.pcm "hdmi_iec958"
-    }
-
-    pcm.hdmi_iec958 {
-        type iec958
-        slave.pcm "hw:vc4hdmi0"
-        slave.format IEC958_SUBFRAME_LE
-    }
+Then point the player at `keepaliveProxy`.
 
 
 ## Building
@@ -94,143 +65,58 @@ insert the keepalive plugin at the appropriate point:
 ### Dependencies
 
 Build:
-- libasound2-dev (ALSA library headers)
+- libasound2-dev
 - gcc
 - make
 
 Runtime:
-- libasound2 (present on any Linux system with ALSA)
-
-No additional runtime dependencies.
+- libasound2
 
 ### Native build
 
     make
 
-### Cross-compile (e.g. for Raspberry Pi armhf)
+Produces `libasound_module_pcm_keepalive.so` and `audio-keepalive-daemon`.
+
+### Cross-compile
 
     make CROSS_COMPILE=arm-linux-gnueabihf-
-
-### Cross-compile for aarch64
-
     make CROSS_COMPILE=aarch64-linux-gnu-
 
-### Strip for deployment
-
-    make strip
-
-### Docker multi-arch build
+### Docker multi-arch
 
     chmod +x build.sh
     ./build.sh
 
-Produces binaries for armhf, arm64, and amd64 in the dist/ directory.
+Writes `dist/armhf/`, `dist/arm64/`, and `dist/amd64/`.
 
 
 ## Installation
 
-Copy the shared object to the ALSA external plugin directory:
-
-    # determine the correct path
     ALSA_PLUGIN_DIR=$(pkg-config --variable=libdir alsa)/alsa-lib
-
-    # install
     sudo install -m 0644 libasound_module_pcm_keepalive.so \
         ${ALSA_PLUGIN_DIR}/libasound_module_pcm_keepalive.so
+    sudo install -m 0755 audio-keepalive-daemon /usr/bin/audio-keepalive-daemon
 
-Common paths:
-- armhf: /usr/lib/arm-linux-gnueabihf/alsa-lib/
-- arm64: /usr/lib/aarch64-linux-gnu/alsa-lib/
-- amd64: /usr/lib/x86_64-linux-gnu/alsa-lib/
+On Volumio the plugin package installs both binaries, the systemd unit,
+and the ALSA contribution.
 
 
 ## Verification
 
-After installation and asound.conf configuration:
+    # daemon must be running
+    aplay -D keepaliveProxy /usr/share/sounds/alsa/Front_Center.wav
 
-    # play something, then stop it
-    aplay -D keepalive_out /usr/share/sounds/alsa/Front_Center.wav
-
-    # check PCM state after playback ends
+    # after playback ends the hardware PCM should stay RUNNING
     cat /proc/asound/card0/pcm0p/sub0/status
 
-Should show "state: RUNNING" even after playback stops. Without
-the plugin, it would show "closed".
-
-
-## Technical detail
-
-### Architecture
-
-The plugin uses the ALSA ioplug (external I/O plugin) API. It
-implements the mandatory callbacks (start, stop, pointer, transfer)
-plus hw_params, prepare, drain, close, and poll handling.
-
-A dedicated pthread feeds silence frames to the downstream device
-when no audio is flowing from the upstream application. The thread
-coordinates with the transfer callback via mutex and condition
-variable to ensure silence writes and audio writes never overlap
-on the slave PCM handle.
-
-The downstream (slave) PCM connection is held in persistent static
-state that survives application close/reopen cycles. When the
-application closes the plugin, the slave stays open. When the next
-application instance opens the plugin with matching format
-parameters, it reclaims the existing slave connection without any
-gap.
-
-If the new instance requests different format parameters (sample
-rate, bit depth, channels), the slave is closed and reopened with
-the new configuration. This is the only scenario where a brief
-gap occurs, and it is unavoidable because the hardware must
-reconfigure for the new format.
-
-### Thread safety
-
-- Mutex (kd->mtx) protects the active/in_write flags
-- Condition variable (kd->cond) synchronises start/stop transitions
-- Persistent state mutex (persist.lock) protects slave PCM access
-- The start callback waits for any in-progress silence write to
-  complete before allowing audio passthrough
-- No overlap between silence writes and audio writes is possible
-
-### Error recovery
-
-- EPIPE (buffer underrun): automatic snd_pcm_prepare() and retry
-- ESTRPIPE (suspended): wait for resume, then prepare
-- Slave open failure: error propagated to application
-- Thread creation failure: error propagated to application
-
-### Poll mechanism
-
-Uses Linux eventfd for signaling. The ioplug framework polls on
-the eventfd and calls transfer when data is available. The plugin
-signals the eventfd after each successful write to indicate
-readiness for more data.
-
-
-## Prior art
-
-- Kodi ActiveAESink (xbmc/cores/AudioEngine/Engines/ActiveAE/ActiveAESink.cpp):
-  Application-level silence injection with state machine
-  (S_TOP_CONFIGURED_SILENCE state). GenerateNoise() produces
-  -100dB Gaussian white noise or zeros. Integrated into Kodi's
-  audio engine, not reusable by other applications.
-
-- MPD always_on parameter: Keeps ALSA handle open but calls
-  snd_pcm_drop() which stops the PCM stream. No audio frames
-  flow. Ineffective for HDMI/SPDIF where continuous frames
-  are required.
-
-- PulseAudio module-suspend-on-idle: Controls when sinks are
-  suspended. Does not inject silence into the ALSA stream.
-
-This plugin provides the Kodi approach as a standalone ALSA
-component usable by any application.
+On any device, including analogue speakers, create `/data/keepalive`
+to raise the mix from -100 dB to an audible test hiss (-30 dB by
+default). Optional file contents: a dB value (`-24`, or `24`).
+Clamped to -80…-12. Remove the file to return to silent keepalive.
+The daemon picks the change up without a restart.
 
 
 ## License
 
 GPL-2.0-or-later
-
-See LICENSE file for full text.

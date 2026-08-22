@@ -2,3 +2,4 @@
 *.so.*
 *.o
 dist/
+audio-keepalive-daemon
