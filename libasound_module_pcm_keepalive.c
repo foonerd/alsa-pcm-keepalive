@@ -41,6 +41,7 @@ struct keepalive_data {
     char *socket_path;
 
     int sock;
+    int opened;
     int timer_fd;
     int event_fd;
     int timer_active;
@@ -117,6 +118,7 @@ static void disconnect_daemon(struct keepalive_data *kd)
         kd->sock = -1;
     }
     kd->daemon_avail = 0;
+    kd->opened = 0;
 }
 
 static int connect_daemon(struct keepalive_data *kd)
@@ -191,12 +193,16 @@ static int open_stream(struct keepalive_data *kd)
                         ? ok.frame_bytes
                         : ka_frame_bytes(kd->io.format, kd->io.channels);
         kd->daemon_avail = ok.buffer_size;
+        kd->opened = 1;
         return 0;
     }
 
-    if (hdr.type == KA_MSG_OPEN_ERR && hdr.size >= sizeof(er)) {
-        ka_recv_payload(kd->sock, &er, sizeof(er));
-        err = er.err ? er.err : -EIO;
+    if (hdr.type == KA_MSG_OPEN_ERR) {
+        if (hdr.size >= sizeof(er))
+            ka_recv_payload(kd->sock, &er, sizeof(er));
+        else if (hdr.size)
+            ka_recv_payload(kd->sock, &er, hdr.size);
+        err = (hdr.size >= sizeof(er) && er.err) ? er.err : -EIO;
         goto fail;
     }
 
@@ -293,13 +299,17 @@ static int keepalive_hw_params(snd_pcm_ioplug_t *io,
 
 static int keepalive_prepare(snd_pcm_ioplug_t *io)
 {
-    (void)io;
+    struct keepalive_data *kd = io->private_data;
+    if (!kd->opened)
+        return -ENODEV;
     return 0;
 }
 
 static int keepalive_start(snd_pcm_ioplug_t *io)
 {
     struct keepalive_data *kd = io->private_data;
+    if (!kd->opened)
+        return -ENODEV;
     int err = set_timer(kd, 1);
     if (err == 0)
         err = set_event(kd, 1);
@@ -333,6 +343,9 @@ static snd_pcm_sframes_t keepalive_pointer(snd_pcm_ioplug_t *io)
     snd_pcm_sframes_t buffered;
     uint64_t timer_val = 0;
     ssize_t s;
+
+    if (!kd->opened || kd->sock < 0)
+        return -EPIPE;
 
     if (io->state == SND_PCM_STATE_XRUN)
         return -EPIPE;
@@ -485,6 +498,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(keepalive)
     }
 
     kd->sock = -1;
+    kd->opened = 0;
     kd->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     if (kd->timer_fd < 0) {
         err = -errno;

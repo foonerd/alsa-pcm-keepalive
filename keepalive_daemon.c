@@ -313,7 +313,6 @@ static int open_named(const char *name, unsigned int rate, unsigned int channels
     if (err < 0)
         goto fail;
 
-    close_output();
     g_pcm = pcm;
     g_rate = rate;
     g_channels = channels;
@@ -344,6 +343,10 @@ static int open_output(unsigned int rate, unsigned int channels,
                        snd_pcm_uframes_t buffer)
 {
     int err;
+
+    /* hw/iec958 is exclusive. Opening a second handle while we still
+     * own the device returns EBUSY (and MPD then faults on OPEN_ERR). */
+    close_output();
 
     err = open_named(g_pcm_name, rate, channels, format, period, buffer);
     if (err < 0 && g_fallback_pcm && strcmp(g_pcm_name, g_fallback_pcm) != 0) {
@@ -443,6 +446,10 @@ static void handle_open(const struct ka_open *req)
         need_reopen = 1;
 
     if (need_reopen) {
+        log_info("reopen for client rate=%u ch=%u fmt=%s (was %u/%u/%s)",
+                 req->rate, req->channels,
+                 snd_pcm_format_name((snd_pcm_format_t)req->format),
+                 g_rate, g_channels, snd_pcm_format_name(g_format));
         err = open_output(req->rate, req->channels,
                           (snd_pcm_format_t)req->format,
                           req->period_size, req->buffer_size);
