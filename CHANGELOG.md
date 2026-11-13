@@ -4,6 +4,21 @@ All notable changes to Audio Keepalive. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the plugin uses
 [semantic versioning](https://semver.org/).
 
+## [2.1.1] - 2026-11-13
+
+### Fixed
+
+- The release zip carried `node_modules`. The plugin now uses Node's own
+  modules and Volumio's `kew` and `v-conf`, and packaging refuses a zip with
+  node modules in it.
+
+### Changed
+
+- The ALSA client is in the plugin's `asound/<arch>/`, linked as
+  `asound/libasound_module_pcm_keepalive.so` beside the contribution that
+  loads it; the daemon stays in `bin/<arch>/`.
+- The daemon's unit is shipped in `systemd/`.
+
 ## [2.1.0] - 2026-11-13
 
 ### Fixed

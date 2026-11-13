@@ -34,14 +34,14 @@ echo "Architecture: $ARCH"
 # =============================================================================
 chmod +x "$PLUGIN_DIR"/bin/*/"$DAEMON" 2>/dev/null || true
 [ -x "$PLUGIN_DIR/bin/$ARCH/$DAEMON" ] || refuse "ERROR: no daemon for architecture $ARCH (available: $(ls "$PLUGIN_DIR/bin" 2>/dev/null | tr '\n' ' '))"
-[ -f "$PLUGIN_DIR/bin/$ARCH/$MODULE" ] || refuse "ERROR: no ALSA client for architecture $ARCH"
+[ -f "$PLUGIN_DIR/asound/$ARCH/$MODULE" ] || refuse "ERROR: no ALSA client for architecture $ARCH"
 "$PLUGIN_DIR/bin/$ARCH/$DAEMON" --version >/dev/null 2>&1 || refuse "ERROR: the daemon for $ARCH does not run on this machine"
 echo "Daemon: $("$PLUGIN_DIR/bin/$ARCH/$DAEMON" --version)"
 
-# One name for each binary, whatever the architecture: the unit names the daemon,
-# the ALSA contribution names the client.
+# One name for each binary, whatever the architecture: the unit names the daemon
+# in bin/, the ALSA contribution names the client in asound/.
 ln -sf "$PLUGIN_DIR/bin/$ARCH/$DAEMON" "$PLUGIN_DIR/bin/$DAEMON"
-ln -sf "$PLUGIN_DIR/bin/$ARCH/$MODULE" "$PLUGIN_DIR/bin/$MODULE"
+ln -sf "$PLUGIN_DIR/asound/$ARCH/$MODULE" "$PLUGIN_DIR/asound/$MODULE"
 chown -R volumio:volumio "$PLUGIN_DIR"
 
 # =============================================================================
@@ -56,7 +56,7 @@ done
 # =============================================================================
 # SETUP: the daemon's unit. Not enabled: the plugin starts and stops it.
 # =============================================================================
-install -m 644 "$PLUGIN_DIR/audio-keepalive.service" "$UNIT"
+install -m 644 "$PLUGIN_DIR/systemd/audio-keepalive.service" "$UNIT"
 systemctl daemon-reload
 
 # =============================================================================

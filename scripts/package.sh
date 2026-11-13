@@ -1,7 +1,8 @@
 #!/bin/bash
 # The plugin as the zip a player installs: dist/audio_keepalive-<version>.zip, with the
-# plugin's files at its root, the daemon and the ALSA client from bin/<arch> for every
-# architecture, the licence, build.json naming the commit, and the node modules.
+# plugin's files at its root, the daemon in bin/<arch> and the ALSA client in
+# asound/<arch> for every architecture, the licence and build.json naming the commit.
+# No node_modules: the plugin uses only Node's own modules and Volumio's kew and v-conf.
 #
 # The version is plugin/package.json's; the daemon carries the same one.
 set -euo pipefail
@@ -15,7 +16,7 @@ rm -rf "$ROOT/dist/stage"
 mkdir -p "$STAGE" "$ROOT/dist"
 cp -r "$ROOT/plugin/." "$STAGE/"
 rm -rf "${STAGE:?}/node_modules" "${STAGE:?}/package-lock.json" "${STAGE:?}/bin"
-rm -f "$STAGE"/asound/*.conf
+rm -f "$STAGE"/asound/*.conf "$STAGE"/asound/*.so
 cp "$ROOT/LICENSE" "$STAGE/LICENSE"
 
 # The build the zip carries: the commit and the time.
@@ -29,23 +30,12 @@ for arch in $ARCHES; do
     [ -f "$bin" ] || { echo "package: $bin is missing; run scripts/ship.sh first" >&2; exit 1; }
   done
   install -D -m 755 "$ROOT/bin/$arch/audio-keepalive-daemon" "$STAGE/bin/$arch/audio-keepalive-daemon"
-  install -D -m 644 "$ROOT/bin/$arch/libasound_module_pcm_keepalive.so" "$STAGE/bin/$arch/libasound_module_pcm_keepalive.so"
+  install -D -m 644 "$ROOT/bin/$arch/libasound_module_pcm_keepalive.so" "$STAGE/asound/$arch/libasound_module_pcm_keepalive.so"
 done
 
-# Node modules: with npm on this machine, directly; otherwise in a container with the
-# Node major Volumio ships. A zip without them is no plugin: the install must succeed,
-# and every module package.json names must be there.
-if command -v npm >/dev/null 2>&1; then
-  ( cd "$STAGE" && npm install --omit=dev --no-audit --no-fund --loglevel=error >/dev/null )
-else
-  docker run --rm -v "$STAGE:/plugin" -w /plugin node:20-bookworm-slim sh -c \
-    "npm install --omit=dev --no-audit --no-fund --loglevel=error >/dev/null; rc=\$?; chown -R $(id -u):$(id -g) /plugin/node_modules /plugin/package-lock.json 2>/dev/null; exit \$rc" \
-    || { echo "package: npm install failed; the zip was not made" >&2; exit 1; }
+if [ -e "$STAGE/node_modules" ] || grep -q '"dependencies"' "$STAGE/package.json"; then
+  echo "package: the plugin must not carry node modules; the zip was not made" >&2; exit 1
 fi
-rm -f "$STAGE/package-lock.json"
-for module in $(sed -n '/"dependencies"/,/}/p' "$STAGE/package.json" | sed -n 's/^ *"\([^"]*\)": *"[^"]*",*$/\1/p'); do
-  [ -f "$STAGE/node_modules/$module/package.json" ] || { echo "package: the module $module is not in the stage; the zip was not made" >&2; exit 1; }
-done
 
 ZIP=$ROOT/dist/$NAME-$VERSION.zip
 rm -f "$ZIP"

@@ -48,10 +48,12 @@ bursts and is not an encoded Dolby/DTS passthrough keepalive.
 `plugin/` is the Audio Keepalive plugin for Volumio 4 (bookworm). Its
 one switch writes the ALSA contribution, rebuilds Volumio's ALSA
 configuration and starts the daemon. Everything stays in the plugin
-folder: the daemon and the ALSA client for the player's architecture
-are in `bin/<arch>/`, and the contribution names the client by path, so
-nothing is installed under the system's `alsa-lib` directory. The
-install also removes what 2.0.x put in `/usr/bin` and `alsa-lib`.
+folder: the daemon for each architecture is in `bin/<arch>/`, the ALSA
+client in `asound/<arch>/` beside the contribution that names it by
+path, and the daemon's unit in `systemd/`. Nothing is installed under
+the system's `alsa-lib` directory, and the install removes what 2.0.x
+put in `/usr/bin` and `alsa-lib`. The zip carries no `node_modules`:
+the plugin uses Node's own modules and Volumio's `kew` and `v-conf`.
 
 Released plugins are on the
 [releases page](https://github.com/foonerd/alsa-pcm-keepalive/releases):

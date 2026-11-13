@@ -36,17 +36,19 @@ jobs:
       - name: The zip names the commit it was built from
         run: |
           unzip -p dist/audio_keepalive-*.zip build.json | grep -F "\"commit\": \"$(git rev-parse --short HEAD)\""
-      - name: The zip carries the daemon and the ALSA client for every architecture, the licence, and the modules
+      - name: The zip carries the daemon and the ALSA client for every architecture, the unit, the licence, and no node modules
         run: |
           for arch in arm armv7 armv8 x64; do
-            for file in audio-keepalive-daemon libasound_module_pcm_keepalive.so; do
-              unzip -l dist/audio_keepalive-*.zip | grep -q " bin/$arch/$file\$" || { echo "no bin/$arch/$file in the zip" >&2; exit 1; }
+            for file in bin/$arch/audio-keepalive-daemon asound/$arch/libasound_module_pcm_keepalive.so; do
+              unzip -l dist/audio_keepalive-*.zip | grep -q " $file\$" || { echo "no $file in the zip" >&2; exit 1; }
             done
           done
-          unzip -l dist/audio_keepalive-*.zip | grep -q " LICENSE\$" || { echo "no LICENSE in the zip" >&2; exit 1; }
-          for module in fs-extra kew v-conf; do
-            unzip -l dist/audio_keepalive-*.zip | grep -q " node_modules/$module/package.json\$" || { echo "no module $module in the zip" >&2; exit 1; }
+          for file in LICENSE systemd/audio-keepalive.service; do
+            unzip -l dist/audio_keepalive-*.zip | grep -q " $file\$" || { echo "no $file in the zip" >&2; exit 1; }
           done
+          if unzip -l dist/audio_keepalive-*.zip | grep -q " node_modules/"; then
+            echo "the zip carries node_modules" >&2; exit 1
+          fi
       - uses: actions/upload-artifact@v7
         with:
           name: release-plugin
