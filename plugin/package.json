@@ -13,7 +13,7 @@
       "bookworm"
     ],
     "details": "Keeps the output open so HDMI receivers, SPDIF decoders and USB DACs do not drop lock when idle. Music passes through unchanged; inaudible noise is written only while nothing plays.",
-    "changelog": "v2.1.1: No bundled node modules; the ALSA client lives in asound/ and the unit in systemd/. v2.1.0: Music passes through unchanged and without gaps, and nothing queued is lost on pause, stop or a short device write. Noise only while idle.",
+    "changelog": "v2.1.1: Keeps the audio output open so HDMI receivers, S/PDIF decoders and USB DACs do not drop lock while nothing plays: a daemon owns the output and writes inaudible noise only while idle; music passes through unchanged and without gaps, paced to the device, and nothing queued is lost on pause, stop or a short device write.",
     "architectures": [
       "amd64",
       "armhf"
