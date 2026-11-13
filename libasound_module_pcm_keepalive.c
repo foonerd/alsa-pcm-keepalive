@@ -15,6 +15,7 @@
 #include <alsa/pcm_external.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
@@ -42,6 +43,7 @@ struct keepalive_data {
 
     int sock;
     int opened;
+    int drained;
     int timer_fd;
     int event_fd;
     int timer_active;
@@ -49,6 +51,7 @@ struct keepalive_data {
 
     unsigned int frame_bytes;
     uint32_t daemon_avail;
+    uint32_t daemon_buffer_size;
 };
 
 static int set_timer(struct keepalive_data *kd, int on)
@@ -62,7 +65,7 @@ static int set_timer(struct keepalive_data *kd, int on)
 
     if (on) {
         if (kd->io.period_size && kd->io.rate)
-            wake_ns = (long long)kd->io.period_size * 500000000LL
+            wake_ns = (long long)kd->io.period_size * 1000000000LL
                     / (long long)kd->io.rate;
         else
             wake_ns = 10000000LL;
@@ -143,8 +146,8 @@ static int connect_daemon(struct keepalive_data *kd)
                  kd->socket_path ? kd->socket_path : KA_SOCKET_PATH);
 
         if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-            tv.tv_sec = 0;
-            tv.tv_usec = 200000;
+            tv.tv_sec = 2;
+            tv.tv_usec = 0;
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
             kd->sock = fd;
@@ -193,7 +196,9 @@ static int open_stream(struct keepalive_data *kd)
                         ? ok.frame_bytes
                         : ka_frame_bytes(kd->io.format, kd->io.channels);
         kd->daemon_avail = ok.buffer_size;
+        kd->daemon_buffer_size = ok.buffer_size;
         kd->opened = 1;
+        kd->drained = 0;
         return 0;
     }
 
@@ -228,18 +233,30 @@ static int send_frames(struct keepalive_data *kd, const char *buf,
         return -EINVAL;
 
     err = ka_send_msg(kd->sock, KA_MSG_DATA, buf, bytes);
-    if (err < 0)
+    if (err < 0) {
+        SNDERR("keepalive: sending %u audio bytes failed: %s",
+               bytes, strerror(-err));
         return err;
+    }
 
     err = ka_recv_hdr(kd->sock, &hdr);
-    if (err < 0)
+    if (err < 0) {
+        SNDERR("keepalive: waiting for audio acknowledgement failed: %s",
+               strerror(-err));
         return err;
-    if (hdr.type != KA_MSG_ACK || hdr.size < sizeof(ack))
+    }
+    if (hdr.type != KA_MSG_ACK || hdr.size != sizeof(ack)) {
+        SNDERR("keepalive: invalid audio acknowledgement type=%u size=%u",
+               hdr.type, hdr.size);
         return -EPROTO;
+    }
 
     err = ka_recv_payload(kd->sock, &ack, sizeof(ack));
-    if (err < 0)
+    if (err < 0) {
+        SNDERR("keepalive: reading audio acknowledgement failed: %s",
+               strerror(-err));
         return err;
+    }
 
     if (ack.frames < 0)
         return ack.frames;
@@ -289,6 +306,111 @@ static snd_pcm_sframes_t write_to_daemon(snd_pcm_ioplug_t *io,
     return written;
 }
 
+static int keepalive_drain(snd_pcm_ioplug_t *io)
+{
+    struct keepalive_data *kd = io->private_data;
+    struct ka_hdr hdr;
+    struct ka_open_err er;
+    snd_pcm_sframes_t buffered;
+    long long timeout_ms;
+    struct timespec now;
+    struct timespec deadline;
+    struct timeval tv;
+    int err;
+
+    if (!kd->opened || kd->sock < 0)
+        return -ENODEV;
+
+    set_timer(kd, 0);
+    timeout_ms = 3000;
+    if (io->rate) {
+        timeout_ms += ((long long)io->buffer_size + kd->daemon_buffer_size)
+                    * 1000 / io->rate;
+    }
+    if (timeout_ms > 60000)
+        timeout_ms = 60000;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+        return -errno;
+    deadline = now;
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (timeout_ms % 1000) * 1000000;
+    if (deadline.tv_nsec >= 1000000000) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000;
+    }
+
+    while ((buffered = snd_pcm_ioplug_hw_avail(io, io->hw_ptr,
+                                                io->appl_ptr)) > 0) {
+        snd_pcm_sframes_t moved =
+            write_to_daemon(io, 0, (snd_pcm_uframes_t)buffered);
+
+        if (moved < 0) {
+            err = (int)moved;
+            goto fail;
+        }
+        if (moved > 0) {
+            io->hw_ptr += (snd_pcm_uframes_t)moved;
+            continue;
+        }
+
+        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+            err = -errno;
+            goto fail;
+        }
+        if (now.tv_sec > deadline.tv_sec ||
+            (now.tv_sec == deadline.tv_sec &&
+             now.tv_nsec >= deadline.tv_nsec)) {
+            err = -ETIMEDOUT;
+            goto fail;
+        }
+        usleep(1000);
+    }
+
+    err = ka_send_msg(kd->sock, KA_MSG_DRAIN, NULL, 0);
+    if (err < 0)
+        goto fail;
+
+    tv.tv_sec = (time_t)(timeout_ms / 1000);
+    tv.tv_usec = (suseconds_t)((timeout_ms % 1000) * 1000);
+    if (setsockopt(kd->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        err = -errno;
+        goto fail;
+    }
+
+    err = ka_recv_hdr(kd->sock, &hdr);
+    if (err < 0)
+        goto restore_timeout;
+
+    if (hdr.type == KA_MSG_DRAIN_OK && hdr.size == 0) {
+        kd->drained = 1;
+        err = 0;
+    } else if (hdr.type == KA_MSG_DRAIN_ERR &&
+               hdr.size == sizeof(er)) {
+        err = ka_recv_payload(kd->sock, &er, sizeof(er));
+        if (err == 0)
+            err = er.err ? er.err : -EIO;
+    } else {
+        err = -EPROTO;
+    }
+
+restore_timeout:
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    if (setsockopt(kd->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0 &&
+        err == 0)
+        err = -errno;
+    if (err < 0)
+        goto fail;
+    return 0;
+
+fail:
+    if (err >= 0)
+        err = -EIO;
+    disconnect_daemon(kd);
+    return err;
+}
+
 static int keepalive_hw_params(snd_pcm_ioplug_t *io,
                                snd_pcm_hw_params_t *params)
 {
@@ -302,6 +424,7 @@ static int keepalive_prepare(snd_pcm_ioplug_t *io)
     struct keepalive_data *kd = io->private_data;
     if (!kd->opened)
         return -ENODEV;
+    kd->drained = 0;
     return 0;
 }
 
@@ -313,6 +436,8 @@ static int keepalive_start(snd_pcm_ioplug_t *io)
     int err = set_timer(kd, 1);
     if (err == 0)
         err = set_event(kd, 1);
+    if (err == 0)
+        kd->drained = 0;
     return err;
 }
 
@@ -342,6 +467,7 @@ static snd_pcm_sframes_t keepalive_pointer(snd_pcm_ioplug_t *io)
     snd_pcm_sframes_t moved = 0;
     snd_pcm_sframes_t buffered;
     uint64_t timer_val = 0;
+    snd_pcm_uframes_t elapsed;
     ssize_t s;
 
     if (!kd->opened || kd->sock < 0)
@@ -353,6 +479,8 @@ static snd_pcm_sframes_t keepalive_pointer(snd_pcm_ioplug_t *io)
     if (io->state != SND_PCM_STATE_RUNNING &&
         io->state != SND_PCM_STATE_DRAINING)
         return io->hw_ptr;
+    if (!io->period_size)
+        return -EPIPE;
 
     s = read(kd->timer_fd, &timer_val, sizeof(timer_val));
     if (s != sizeof(timer_val) || timer_val == 0)
@@ -360,7 +488,13 @@ static snd_pcm_sframes_t keepalive_pointer(snd_pcm_ioplug_t *io)
 
     buffered = snd_pcm_ioplug_hw_avail(io, io->hw_ptr, io->appl_ptr);
     if (buffered > 0 && kd->sock >= 0) {
+        if (timer_val > (uint64_t)(io->buffer_size / io->period_size))
+            elapsed = io->buffer_size;
+        else
+            elapsed = (snd_pcm_uframes_t)timer_val * io->period_size;
         snd_pcm_sframes_t to_copy = buffered;
+        if (to_copy > (snd_pcm_sframes_t)elapsed)
+            to_copy = (snd_pcm_sframes_t)elapsed;
         if (kd->daemon_avail && to_copy > (snd_pcm_sframes_t)kd->daemon_avail)
             to_copy = (snd_pcm_sframes_t)kd->daemon_avail;
         if (to_copy > 0) {
@@ -379,6 +513,13 @@ static snd_pcm_sframes_t keepalive_pointer(snd_pcm_ioplug_t *io)
 static int keepalive_close(snd_pcm_ioplug_t *io)
 {
     struct keepalive_data *kd = io->private_data;
+
+    if (kd->opened && !kd->drained) {
+        int err = keepalive_drain(io);
+        if (err < 0)
+            SNDERR("keepalive: drain before close failed: %s",
+                   snd_strerror(err));
+    }
 
     disconnect_daemon(kd);
 
@@ -449,6 +590,7 @@ static int keepalive_poll_revents(snd_pcm_ioplug_t *io,
 static const snd_pcm_ioplug_callback_t keepalive_callbacks = {
     .hw_params              = keepalive_hw_params,
     .prepare                = keepalive_prepare,
+    .drain                  = keepalive_drain,
     .start                  = keepalive_start,
     .stop                   = keepalive_stop,
     .transfer               = keepalive_transfer,
@@ -465,6 +607,8 @@ SND_PCM_PLUGIN_DEFINE_FUNC(keepalive)
     const char *socket_path = KA_SOCKET_PATH;
     struct keepalive_data *kd;
     int err;
+
+    (void)root;
 
     snd_config_for_each(i, next, conf) {
         snd_config_t *n = snd_config_iterator_entry(i);
@@ -499,6 +643,7 @@ SND_PCM_PLUGIN_DEFINE_FUNC(keepalive)
 
     kd->sock = -1;
     kd->opened = 0;
+    kd->drained = 0;
     kd->timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     if (kd->timer_fd < 0) {
         err = -errno;

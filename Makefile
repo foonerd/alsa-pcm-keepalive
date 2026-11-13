@@ -46,7 +46,7 @@ else
   endif
 endif
 
-.PHONY: all clean strip install
+.PHONY: all clean strip install test
 
 all: $(PLUGIN) $(DAEMON)
 
@@ -67,3 +67,6 @@ install: $(PLUGIN) $(DAEMON)
 	install -m 0644 $(PLUGIN) $(DESTDIR)/alsa-lib/$(PLUGIN)
 	install -d $(DESTDIR)/bin
 	install -m 0755 $(DAEMON) $(DESTDIR)/bin/$(DAEMON)
+
+test: all
+	python3 -m unittest discover -s tests -v

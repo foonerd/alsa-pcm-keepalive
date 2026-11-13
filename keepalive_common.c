@@ -1,5 +1,5 @@
 /*
- * Shared keepalive helpers: noise, mix, framed socket I/O.
+ * Shared keepalive helpers: idle noise and framed socket I/O.
  *
  * Copyright (C) 2026 Just a Nerd
  * License: GPL-2.0-or-later
@@ -11,6 +11,22 @@
 #include <math.h>
 #include <string.h>
 #include <unistd.h>
+
+static uint32_t noise_random(void)
+{
+    static uint32_t state = 0xDEADBEEFu;
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+static double gaussian_sample(void)
+{
+    double u1 = ((double)noise_random() + 1.0) / 4294967297.0;
+    double u2 = (double)noise_random() / 4294967296.0;
+    return sqrt(-2.0 * log(u1)) * cos(6.283185307179586 * u2);
+}
 
 unsigned int ka_frame_bytes(snd_pcm_format_t format, unsigned int channels)
 {
@@ -26,14 +42,17 @@ void ka_fill_noise(char *buf, snd_pcm_uframes_t frames,
 {
     unsigned int sample_bits = (unsigned int)snd_pcm_format_physical_width(format);
     unsigned int sample_bytes = sample_bits / 8u;
-    unsigned int total_samples = (unsigned int)frames * channels;
-    unsigned int i;
+    size_t total_samples = (size_t)frames * channels;
+    size_t i;
     int width = snd_pcm_format_width(format);
+    int big_endian = snd_pcm_format_big_endian(format) > 0;
     double linear;
 
-    if (!buf || !total_samples || !sample_bytes)
+    if (!buf || !total_samples || !sample_bytes || width <= 0)
         return;
 
+    if (!isfinite(db))
+        db = KA_NOISE_DB_IDLE;
     if (db > 0.0)
         db = -db;
     linear = pow(10.0, db / 20.0);
@@ -44,130 +63,36 @@ void ka_fill_noise(char *buf, snd_pcm_uframes_t frames,
 
     if (format == SND_PCM_FORMAT_FLOAT_LE) {
         float *fbuf = (float *)buf;
-        float amp = (float)linear;
-        unsigned int seed = 0xDEADBEEF;
         for (i = 0; i < total_samples; i++) {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            fbuf[i] = ((float)(seed % 20001u) - 10000.0f) / 10000.0f * amp;
+            double sample = gaussian_sample() * linear;
+            if (sample > 1.0)
+                sample = 1.0;
+            if (sample < -1.0)
+                sample = -1.0;
+            fbuf[i] = (float)sample;
         }
         return;
     }
 
-    long long full_scale = 1LL << (width > 1 ? (width - 1) : 0);
-    long long amplitude = (long long)(full_scale * linear);
-    if (amplitude < 1)
-        amplitude = 1;
-
-    unsigned int seed = 0xDEADBEEF;
+    int64_t max_value = width >= 32 ? INT32_MAX : (1LL << (width - 1)) - 1;
+    int64_t min_value = width >= 32 ? INT32_MIN : -(1LL << (width - 1));
+    double amplitude = (double)(1LL << (width - 1)) * linear;
 
     for (i = 0; i < total_samples; i++) {
-        seed ^= seed << 13;
-        seed ^= seed >> 17;
-        seed ^= seed << 5;
+        int64_t value = (int64_t)llround(gaussian_sample() * amplitude);
+        unsigned int byte;
 
-        long long val = ((long long)(seed % (unsigned int)(2 * amplitude + 1)))
-                        - amplitude;
+        if (value > max_value)
+            value = max_value;
+        if (value < min_value)
+            value = min_value;
 
-        switch (sample_bytes) {
-        case 2:
-            buf[0] = (char)(val & 0xFF);
-            buf[1] = (char)((val >> 8) & 0xFF);
-            break;
-        case 3:
-            buf[0] = (char)(val & 0xFF);
-            buf[1] = (char)((val >> 8) & 0xFF);
-            buf[2] = (char)((val >> 16) & 0xFF);
-            break;
-        case 4:
-            buf[0] = (char)(val & 0xFF);
-            buf[1] = (char)((val >> 8) & 0xFF);
-            buf[2] = (char)((val >> 16) & 0xFF);
-            buf[3] = (char)((val >> 24) & 0xFF);
-            break;
-        default:
-            buf[0] = (char)(val & 0xFF);
-            break;
+        for (byte = 0; byte < sample_bytes; byte++) {
+            unsigned int shift = 8u * (big_endian
+                ? sample_bytes - byte - 1u : byte);
+            buf[byte] = (char)(((uint64_t)value >> shift) & 0xFFu);
         }
         buf += sample_bytes;
-    }
-}
-
-static int32_t unpack_sample(const unsigned char *p, unsigned int bytes, int width)
-{
-    int32_t v = 0;
-
-    if (bytes == 1) {
-        v = (int8_t)p[0];
-        return v;
-    }
-
-    v = (int32_t)p[0] | ((int32_t)p[1] << 8);
-    if (bytes >= 3)
-        v |= (int32_t)p[2] << 16;
-    if (bytes >= 4)
-        v |= (int32_t)p[3] << 24;
-
-    if (bytes < 4 && width > 0 && width < 32) {
-        unsigned shift = (unsigned)(32 - width);
-        v = (v << shift) >> shift;
-    }
-    return v;
-}
-
-static void pack_sample(unsigned char *p, unsigned int bytes, int32_t v)
-{
-    unsigned int i;
-    for (i = 0; i < bytes; i++)
-        p[i] = (unsigned char)((v >> (8 * (int)i)) & 0xFF);
-}
-
-void ka_mix(char *dst, const char *music, const char *noise,
-            snd_pcm_uframes_t frames, unsigned int channels,
-            snd_pcm_format_t format)
-{
-    unsigned int n = (unsigned int)frames * channels;
-    unsigned int i;
-
-    if (!dst || !music || !noise || !n)
-        return;
-
-    if (format == SND_PCM_FORMAT_FLOAT_LE) {
-        float *d = (float *)dst;
-        const float *m = (const float *)music;
-        const float *nz = (const float *)noise;
-        for (i = 0; i < n; i++) {
-            float v = m[i] + nz[i];
-            if (v > 1.0f)
-                v = 1.0f;
-            if (v < -1.0f)
-                v = -1.0f;
-            d[i] = v;
-        }
-        return;
-    }
-
-    int width = snd_pcm_format_width(format);
-    int phys = snd_pcm_format_physical_width(format);
-    unsigned int bytes = phys > 0 ? (unsigned int)phys / 8u : 0;
-    if (!bytes)
-        return;
-
-    int32_t maxv = (width >= 32) ? 0x7fffffff : ((1 << (width - 1)) - 1);
-    int32_t minv = (width >= 32) ? (int32_t)0x80000000 : -(1 << (width - 1));
-
-    for (i = 0; i < n; i++) {
-        const unsigned char *mp = (const unsigned char *)music + (size_t)i * bytes;
-        const unsigned char *np = (const unsigned char *)noise + (size_t)i * bytes;
-        unsigned char *dp = (unsigned char *)dst + (size_t)i * bytes;
-        int64_t s = (int64_t)unpack_sample(mp, bytes, width)
-                  + (int64_t)unpack_sample(np, bytes, width);
-        if (s > maxv)
-            s = maxv;
-        if (s < minv)
-            s = minv;
-        pack_sample(dp, bytes, (int32_t)s);
     }
 }
 

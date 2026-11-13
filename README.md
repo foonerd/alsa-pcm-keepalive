@@ -1,8 +1,9 @@
 # alsa-pcm-keepalive
 
 Keeps HDMI, SPDIF, and USB outputs locked by writing a continuous PCM
-stream. A small daemon owns the hardware. Players write into a thin
-virtual ALSA PCM that is mixed with inaudible (-100 dB) Gaussian noise.
+stream. A small daemon owns the hardware. Players write through a thin
+virtual ALSA PCM; the daemon forwards their samples unchanged and sends
+inaudible Gaussian noise only while idle.
 
 There is no volume control and no silence/passthrough switch.
 
@@ -29,13 +30,17 @@ process, and two writers sharing one IEC958/USB handle race.
                                         v
                                keepaliveProxyOut --> hw
 
-The daemon is the only writer on the output device. It always emits
-noise. When a player is active, music is mixed in. Mute and volume sit
-upstream, so they never drop the hardware lock.
+The daemon is the only writer on the output device. It forwards music
+without altering the samples, waits for queued music to play before
+acknowledging completion, and keeps writing noise while it waits. Mute
+and volume sit upstream, so they never drop the hardware lock.
 
 Format follows the last client (bit-perfect while playing). Idle keeps
 that format. The hardware is reopened only when rate, bit depth, or
 channel count changes.
+
+This keeps a PCM stream active; it does not generate IEC61937 pause
+bursts and is not an encoded Dolby/DTS passthrough keepalive.
 
 
 ## Configuration

@@ -34,6 +34,9 @@ enum ka_msg_type {
     KA_MSG_DATA     = 4,
     KA_MSG_ACK      = 5,
     KA_MSG_CLOSE    = 6,
+    KA_MSG_DRAIN    = 7,
+    KA_MSG_DRAIN_OK = 8,
+    KA_MSG_DRAIN_ERR = 9,
 };
 
 struct ka_hdr {
@@ -70,10 +73,6 @@ unsigned int ka_frame_bytes(snd_pcm_format_t format, unsigned int channels);
 void ka_fill_noise(char *buf, snd_pcm_uframes_t frames,
                    unsigned int channels, snd_pcm_format_t format,
                    double db);
-
-void ka_mix(char *dst, const char *music, const char *noise,
-            snd_pcm_uframes_t frames, unsigned int channels,
-            snd_pcm_format_t format);
 
 int ka_read_full(int fd, void *buf, size_t n);
 int ka_write_full(int fd, const void *buf, size_t n);
