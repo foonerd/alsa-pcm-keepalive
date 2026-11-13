@@ -2,8 +2,9 @@
  * audio-keepalive-daemon
  *
  * Single writer for the Volumio output path. Holds the downstream PCM
- * open permanently and writes -100 dB Gaussian noise mixed with any
- * frames received from the thin ALSA client plugin.
+ * open permanently, forwards the frames received from the thin ALSA
+ * client plugin unchanged, and writes -100 dB Gaussian noise only while
+ * no music is queued.
  *
  * Copyright (C) 2026 Just a Nerd
  * License: GPL-2.0-or-later
@@ -85,6 +86,7 @@ static int g_inotify_fd = -1;
 static int g_inotify_wd = -1;
 static int g_inotify_data_wd = -1;
 static int g_test_mode;
+static int g_output_hold_ms;
 static double g_noise_db = KA_NOISE_DB_IDLE;
 
 static void close_client(void);
@@ -486,6 +488,7 @@ static void write_period(void)
     snd_pcm_uframes_t to_write;
     snd_pcm_uframes_t music_frames;
 
+    g_output_hold_ms = 0;
     if (!g_pcm || !g_configured)
         return;
 
@@ -512,6 +515,20 @@ static void write_period(void)
             g_pending_frames = music_frames;
             g_pending_music_frames = music_frames;
         } else {
+            /* While a stream is open an empty queue usually means the
+             * next client period is on its way. Filling the free space
+             * with noise now would splice it into the music, so wait
+             * until the device is genuinely running low. */
+            snd_pcm_uframes_t delay = (snd_pcm_uframes_t)avail < g_buffer
+                                    ? g_buffer - (snd_pcm_uframes_t)avail : 0;
+            snd_pcm_uframes_t low = g_buffer / 2;
+
+            if (g_client_active && delay > low) {
+                long long ms = (long long)(delay - low) * 1000LL / g_rate;
+
+                g_output_hold_ms = ms < 1 ? 1 : ms > 20 ? 20 : (int)ms;
+                return;
+            }
             memcpy(g_mix, g_noise, (size_t)g_period * g_frame_bytes);
             g_pending_frames = g_period;
             g_pending_music_frames = 0;
@@ -666,7 +683,9 @@ static int handle_data(const char *payload, uint32_t size)
     size_t frames;
     size_t take;
 
-    if (!g_frame_bytes || !g_client_active || size % g_frame_bytes) {
+    /* The client never sends an empty DATA; one is refused like any other. */
+    if (!payload || !size || !g_frame_bytes || !g_client_active ||
+        size % g_frame_bytes) {
         ack.frames = -EINVAL;
         ack.avail = 0;
         return queue_reply(KA_MSG_ACK, &ack, sizeof(ack));
@@ -698,9 +717,10 @@ static int process_client_request(void)
     g_request_hdr_bytes = 0;
     g_request_payload_bytes = 0;
 
+    /* payload is NULL exactly when hdr.size is 0; each case says so. */
     switch (hdr.type) {
     case KA_MSG_OPEN:
-        if (hdr.size != sizeof(struct ka_open))
+        if (hdr.size != sizeof(struct ka_open) || !payload)
             err = -EPROTO;
         else
             err = handle_open((const struct ka_open *)payload);
@@ -993,7 +1013,8 @@ static void usage(const char *argv0)
             "Usage: %s [options]\n"
             "  --pcm NAME           Output PCM (default %s)\n"
             "  --fallback-pcm NAME  Fallback PCM (default %s)\n"
-            "  --socket PATH        Control socket (default %s)\n",
+            "  --socket PATH        Control socket (default %s)\n"
+            "  --version            Print the version and exit\n",
             argv0, KA_PCM_NAME, KA_FALLBACK_PCM, KA_SOCKET_PATH);
 }
 
@@ -1004,13 +1025,14 @@ int main(int argc, char **argv)
         { "fallback-pcm", required_argument, NULL, 'f' },
         { "socket", required_argument, NULL, 's' },
         { "help", no_argument, NULL, 'h' },
+        { "version", no_argument, NULL, 'V' },
         { 0, 0, 0, 0 }
     };
     int err;
     unsigned long last_open_try = 0;
 
     while (1) {
-        int c = getopt_long(argc, argv, "p:f:s:h", opts, NULL);
+        int c = getopt_long(argc, argv, "p:f:s:hV", opts, NULL);
         if (c < 0)
             break;
         switch (c) {
@@ -1023,6 +1045,9 @@ int main(int argc, char **argv)
         case 's':
             g_socket_path = optarg;
             break;
+        case 'V':
+            printf("audio-keepalive-daemon %s\n", KA_VERSION);
+            return 0;
         case 'h':
         default:
             usage(argv[0]);
@@ -1106,7 +1131,11 @@ int main(int argc, char **argv)
             nfds++;
         }
 
-        if (g_pcm) {
+        if (g_pcm && g_output_hold_ms) {
+            /* The device has room but is being left to play down, so
+             * its POLLOUT would only spin the loop. */
+            timeout = g_output_hold_ms;
+        } else if (g_pcm) {
             int n = snd_pcm_poll_descriptors_count(g_pcm);
             if (n > 0 && nfds + n <= (int)(sizeof(pfds) / sizeof(pfds[0]))) {
                 snd_pcm_poll_descriptors(g_pcm, &pfds[nfds], (unsigned int)n);

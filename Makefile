@@ -30,7 +30,10 @@ STRIP       = $(CROSS_COMPILE)strip
 # SND_PCM_PLUGIN_SYMBOL(). Without it, the macro generates a
 # static-build linked-list entry referencing snd_dlsym_start,
 # which is absent from Volumio's RPi-patched libasound2.
-CFLAGS      = -Wall -Wextra -O2 -fPIC -DPIC
+# Warnings are defects: the build fails on any of them.
+VERSION    ?= $(shell sed -n 's/^ *"version": "\(.*\)",*$$/\1/p' plugin/package.json 2>/dev/null | head -n1)
+CFLAGS      = -Wall -Wextra -Werror -O2 -fPIC -DPIC
+CPPFLAGS   += -DKA_VERSION='"$(VERSION)"'
 PLUGIN_LDFLAGS = -shared -Wl,-soname,$(PLUGIN)
 LIBS        = -lasound -lpthread -lm
 
@@ -51,10 +54,10 @@ endif
 all: $(PLUGIN) $(DAEMON)
 
 $(PLUGIN): $(PLUGIN_SRC) keepalive.h
-	$(CC) $(CFLAGS) $(PLUGIN_LDFLAGS) -o $@ $(PLUGIN_SRC) $(LIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(PLUGIN_LDFLAGS) -o $@ $(PLUGIN_SRC) $(LIBS)
 
 $(DAEMON): $(DAEMON_SRC) keepalive.h
-	$(CC) $(CFLAGS) $(DAEMON_LDFLAGS) -o $@ $(DAEMON_SRC) $(LIBS)
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(DAEMON_LDFLAGS) -o $@ $(DAEMON_SRC) $(LIBS)
 
 strip: $(PLUGIN) $(DAEMON)
 	$(STRIP) $(PLUGIN) $(DAEMON)

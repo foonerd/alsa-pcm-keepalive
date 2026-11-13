@@ -1,3 +1,4 @@
+# The build and test toolchain for scripts/ship.sh and scripts/check.sh.
 FROM debian:bookworm-slim
 
 # Enable multiarch for cross-compilation targets
@@ -21,6 +22,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libasound2-dev \
         libasound2-dev:armhf \
         libasound2-dev:arm64 \
+        alsa-utils \
+        python3 \
+        file \
+        binutils \
     && rm -rf /var/lib/apt/lists/*
 
 # ALSA headers are architecture-independent and installed to
@@ -33,6 +38,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN ln -s /usr/include/alsa /usr/arm-linux-gnueabihf/include/alsa && \
     ln -s /usr/include/alsa /usr/aarch64-linux-gnu/include/alsa
 
-WORKDIR /build
-COPY keepalive.h keepalive_common.c keepalive_daemon.c \
-     libasound_module_pcm_keepalive.c Makefile ./
+# The sources are mounted, not copied: scripts/builder.sh runs a command in the
+# checkout as the calling user.
+ENV KA_BUILDER=1
+WORKDIR /src

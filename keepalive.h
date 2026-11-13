@@ -11,6 +11,10 @@
 #include <alsa/asoundlib.h>
 #include <stdint.h>
 
+#ifndef KA_VERSION
+#define KA_VERSION          "unknown"
+#endif
+
 #define KA_MAGIC            0x4B414C56u  /* 'KALV' */
 #define KA_SOCKET_PATH      "/run/audio-keepalive/ctl.sock"
 #define KA_PCM_NAME         "keepaliveProxyOut"

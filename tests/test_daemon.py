@@ -67,6 +67,8 @@ class KeepaliveDaemonTest(unittest.TestCase):
             if iec958 else capture
         )
         self.config_path.write_text(
+            # Loaded by path, as the plugin's ALSA contribution loads it.
+            f'pcm_type.keepalive {{ lib "{ROOT / "libasound_module_pcm_keepalive.so"}" }}\n'
             f'pcm.probe {{ type keepalive socket "{self.socket_path}" }}\n'
             f"pcm.sink {{ {sink} }}\n",
             encoding="utf-8",
@@ -100,17 +102,17 @@ class KeepaliveDaemonTest(unittest.TestCase):
             time.sleep(0.01)
         self.fail("daemon did not create its control socket")
 
-    def play(self, sample_format, duration_seconds=1):
+    def play(self, sample_format, duration_seconds=1, data=None):
         channels = 2
         bytes_per_sample, sample, target, shift, mask = FORMATS[sample_format]
         frame_count = 44100 * duration_seconds
         input_path = self.directory / "input.raw"
-        input_path.write_bytes(sample * frame_count * channels)
+        input_path.write_bytes(
+            data if data is not None else sample * frame_count * channels)
 
         env = dict(os.environ)
         env.update({
             "ALSA_CONFIG_PATH": str(self.config_path),
-            "ALSA_PLUGIN_DIR": str(ROOT),
         })
         result = subprocess.run(
             [
@@ -162,6 +164,26 @@ class KeepaliveDaemonTest(unittest.TestCase):
         self.play("S16_LE")
         self.stop_daemon()
         self.assert_samples("S16_LE")
+
+    def test_music_reaches_output_contiguously(self):
+        # Idle noise spliced between music periods would play as dropouts
+        # while the sample count still matches.
+        music = os.urandom(44100 * 2 * 2 * 2)
+        self.start_daemon()
+        self.play("S16_LE", data=music)
+        self.stop_daemon()
+        output = self.output_path.read_bytes()
+        start = output.find(music[:64])
+        self.assertGreaterEqual(start, 0, "music start not found in output")
+        self.assertEqual(start % 4, 0)
+        received = output[start:start + len(music)]
+        mismatch = next(
+            (i for i in range(0, len(music), 4)
+             if received[i:i + 4] != music[i:i + 4]),
+            None,
+        )
+        self.assertIsNone(
+            mismatch, f"music interrupted after {mismatch} bytes")
 
     def test_fragmented_client_message_does_not_block_idle_keepalive(self):
         self.start_daemon()

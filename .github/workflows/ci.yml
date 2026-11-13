@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+# The C is built and tested in the builder image (scripts/builder/Dockerfile: Debian
+# bookworm, Volumio 4's glibc and ALSA, the armhf and arm64 cross compilers), built on
+# the runner from the checkout. Node, shellcheck and Docker come with the runner.
+jobs:
+  check:
+    name: C, tests, analyzer, shell, plugin, workflows
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: scripts/check.sh
+
+  ship:
+    name: cross builds, the plugin zip
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: scripts/ship.sh
+      - run: scripts/package.sh
+      - name: The zip names the commit it was built from
+        run: |
+          unzip -p dist/audio_keepalive-*.zip build.json | grep -F "\"commit\": \"$(git rev-parse --short HEAD)\""
+      - name: The zip carries the daemon and the ALSA client for every architecture, the licence, and the modules
+        run: |
+          for arch in arm armv7 armv8 x64; do
+            for file in audio-keepalive-daemon libasound_module_pcm_keepalive.so; do
+              unzip -l dist/audio_keepalive-*.zip | grep -q " bin/$arch/$file\$" || { echo "no bin/$arch/$file in the zip" >&2; exit 1; }
+            done
+          done
+          unzip -l dist/audio_keepalive-*.zip | grep -q " LICENSE\$" || { echo "no LICENSE in the zip" >&2; exit 1; }
+          for module in fs-extra kew v-conf; do
+            unzip -l dist/audio_keepalive-*.zip | grep -q " node_modules/$module/package.json\$" || { echo "no module $module in the zip" >&2; exit 1; }
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: audio_keepalive-plugin
+          path: dist/audio_keepalive-*.zip
+          if-no-files-found: error
