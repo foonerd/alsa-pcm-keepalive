@@ -4,6 +4,18 @@ All notable changes to Audio Keepalive. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the plugin uses
 [semantic versioning](https://semver.org/).
 
+## [2.1.2] - 2026-11-14
+
+### Fixed
+
+- The daemon crashed when a stream followed another at the same sample rate
+  in a wider format, a 24-bit track after a 16-bit one among them: its
+  buffer was kept at the size the narrower format needed and written past
+  its end. The player reported that it could not open the audio output, and
+  playing again worked once the daemon had been restarted. Seen after
+  Volumio's own startup sound, which is 16-bit. The buffer is now made again
+  whenever the size of a frame changes.
+
 ## [2.1.1] - 2026-11-13
 
 ### Fixed

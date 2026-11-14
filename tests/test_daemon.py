@@ -159,6 +159,25 @@ class KeepaliveDaemonTest(unittest.TestCase):
                 self.stop_daemon()
                 self.assert_samples(sample_format)
 
+    def test_a_change_of_format_at_the_same_rate_keeps_the_daemon_and_the_samples(self):
+        # Volumio's startup sound is 16-bit; the first 24-bit track at the
+        # same rate asked the daemon for a wider frame in a buffer of the
+        # same length in frames. The ring was kept, and written past its end.
+        self.start_daemon()
+        for sample_format in ("S16_LE", "S24_3LE", "S16_LE", "S24_3LE"):
+            with self.subTest(format=sample_format):
+                self.play(sample_format)
+                time.sleep(0.2)
+                self.assertIsNone(
+                    self.daemon.poll(),
+                    f"the daemon is gone after {sample_format}:\n"
+                    + self.log_path.read_text(encoding="utf-8"),
+                )
+        log = self.log_path.read_text(encoding="utf-8")
+        self.assertIn("reopen for client", log)
+        self.stop_daemon()
+        self.assert_samples("S24_3LE")
+
     def test_partial_alsa_writes_are_retried_without_losing_samples(self):
         self.start_daemon(partial_writes=True, iec958=True)
         self.play("S16_LE")

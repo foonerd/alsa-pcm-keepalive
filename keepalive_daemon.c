@@ -55,6 +55,9 @@ static char *g_noise;
 static char *g_mix;
 static char *g_ring;
 static size_t g_ring_cap;
+/* The size of a frame when the ring was made: a ring is as many bytes as it
+ * has frames of that size, and no good for a wider one. */
+static size_t g_ring_frame_bytes;
 static size_t g_ring_r;
 static size_t g_ring_w;
 static size_t g_ring_count;
@@ -138,16 +141,21 @@ static int ring_ensure(size_t frames)
     if (!bytes)
         return -EINVAL;
 
-    if (g_ring && g_ring_cap == frames)
+    /* Kept only while it is the same length of the same frames. A change
+     * of format at the same rate and buffer leaves the frames as many and
+     * makes each one wider. */
+    if (g_ring && g_ring_cap == frames && g_ring_frame_bytes == g_frame_bytes)
         return 0;
 
     free(g_ring);
     g_ring = malloc(bytes);
     if (!g_ring) {
         g_ring_cap = 0;
+        g_ring_frame_bytes = 0;
         return -ENOMEM;
     }
     g_ring_cap = frames;
+    g_ring_frame_bytes = g_frame_bytes;
     ring_reset();
     return 0;
 }
