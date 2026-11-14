@@ -4,6 +4,23 @@ All notable changes to Audio Keepalive. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the plugin uses
 [semantic versioning](https://semver.org/).
 
+## [2.1.3] - 2026-11-14
+
+### Added
+
+- `--rate HZ` on the daemon: the sample rate the output idles at before a
+  player asks for one. A player whose first stream is 16-bit stereo at that
+  rate no longer has the output opened again for it.
+
+### Changed
+
+- A change of `asound.conf` reopens the output two seconds after the file
+  was last touched, not a quarter of a second after the first touch, and the
+  daemon goes on playing in the meantime in place of waiting. Volumio
+  restores the mixer in the instant it rewrites the file, and a DAC whose
+  clocks stop and start while its control bus is being written to can lose
+  the write.
+
 ## [2.1.2] - 2026-11-14
 
 ### Fixed

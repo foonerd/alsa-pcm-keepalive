@@ -33,7 +33,12 @@
 #define LOG_PREFIX "audio-keepalive: "
 #define RING_PERIODS 8
 #define OPEN_RETRY_MS 500
-#define INOTIFY_DEBOUNCE_MS 250
+/* How long after the last change of asound.conf the output is opened
+ * again. Whatever rewrote the file is often still at work on the device:
+ * Volumio restores the mixer in the same instant. Reopening the output
+ * stops and starts the device's clocks, and a DAC that is being written to
+ * over its control bus at that moment may lose the write, or worse. */
+#define CONF_SETTLE_MS 2000
 
 static volatile sig_atomic_t g_run = 1;
 static volatile sig_atomic_t g_reopen = 0;
@@ -85,6 +90,9 @@ static size_t g_request_payload_bytes;
 static char g_reply[sizeof(struct ka_hdr) + sizeof(struct ka_open_ok)];
 static size_t g_reply_size;
 static size_t g_reply_sent;
+/* When the output is due to be opened again for a changed asound.conf, in
+ * milliseconds of the monotonic clock; 0 when it is not. */
+static unsigned long g_conf_reopen_at;
 static int g_inotify_fd = -1;
 static int g_inotify_wd = -1;
 static int g_inotify_data_wd = -1;
@@ -980,6 +988,15 @@ static void setup_inotify(void)
     }
 }
 
+static unsigned long now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long)ts.tv_sec * 1000ul
+         + (unsigned long)ts.tv_nsec / 1000000ul;
+}
+
 static void drain_inotify(void)
 {
     char buf[4096];
@@ -1007,9 +1024,12 @@ static void drain_inotify(void)
     }
 
     if (asound_hit) {
-        log_info("asound.conf changed — reopening output");
-        usleep(INOTIFY_DEBOUNCE_MS * 1000);
-        open_output(g_rate, g_channels, g_format, g_period, g_buffer);
+        /* Not now: once the file has been left alone for a while. The
+         * output goes on playing as it is until then. */
+        if (!g_conf_reopen_at)
+            log_info("asound.conf changed — reopening output in %d ms",
+                     CONF_SETTLE_MS);
+        g_conf_reopen_at = now_ms() + CONF_SETTLE_MS;
     }
     if (sentinel_hit)
         apply_sentinel(0);
@@ -1022,8 +1042,11 @@ static void usage(const char *argv0)
             "  --pcm NAME           Output PCM (default %s)\n"
             "  --fallback-pcm NAME  Fallback PCM (default %s)\n"
             "  --socket PATH        Control socket (default %s)\n"
+            "  --rate HZ            Sample rate the output idles at before a\n"
+            "                       player asks for one (default %u)\n"
             "  --version            Print the version and exit\n",
-            argv0, KA_PCM_NAME, KA_FALLBACK_PCM, KA_SOCKET_PATH);
+            argv0, KA_PCM_NAME, KA_FALLBACK_PCM, KA_SOCKET_PATH,
+            KA_DEFAULT_RATE);
 }
 
 int main(int argc, char **argv)
@@ -1032,6 +1055,7 @@ int main(int argc, char **argv)
         { "pcm", required_argument, NULL, 'p' },
         { "fallback-pcm", required_argument, NULL, 'f' },
         { "socket", required_argument, NULL, 's' },
+        { "rate", required_argument, NULL, 'r' },
         { "help", no_argument, NULL, 'h' },
         { "version", no_argument, NULL, 'V' },
         { 0, 0, 0, 0 }
@@ -1040,7 +1064,7 @@ int main(int argc, char **argv)
     unsigned long last_open_try = 0;
 
     while (1) {
-        int c = getopt_long(argc, argv, "p:f:s:hV", opts, NULL);
+        int c = getopt_long(argc, argv, "p:f:s:r:hV", opts, NULL);
         if (c < 0)
             break;
         switch (c) {
@@ -1053,6 +1077,18 @@ int main(int argc, char **argv)
         case 's':
             g_socket_path = optarg;
             break;
+        case 'r': {
+            char *end = NULL;
+            unsigned long rate = strtoul(optarg, &end, 10);
+
+            if (!end || *end || rate < 8000ul || rate > 384000ul) {
+                fprintf(stderr, "%s: --rate takes 8000 to 384000, not %s\n",
+                        argv[0], optarg);
+                return 1;
+            }
+            g_rate = (unsigned int)rate;
+            break;
+        }
         case 'V':
             printf("audio-keepalive-daemon %s\n", KA_VERSION);
             return 0;
@@ -1091,12 +1127,15 @@ int main(int argc, char **argv)
             open_output(g_rate, g_channels, g_format, g_period, g_buffer);
         }
 
+        if (g_conf_reopen_at && now_ms() >= g_conf_reopen_at) {
+            g_conf_reopen_at = 0;
+            log_info("reopening output for the changed asound.conf");
+            open_output(g_rate, g_channels, g_format, g_period, g_buffer);
+        }
+
         if (!g_configured) {
-            struct timespec ts;
-            unsigned long now;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            now = (unsigned long)ts.tv_sec * 1000ul
-                + (unsigned long)ts.tv_nsec / 1000000ul;
+            unsigned long now = now_ms();
+
             if (now - last_open_try >= OPEN_RETRY_MS) {
                 last_open_try = now;
                 open_output(g_rate, g_channels, g_format, 1024, 4096);
@@ -1104,11 +1143,8 @@ int main(int argc, char **argv)
         }
 
         {
-            struct timespec ts;
-            unsigned long now;
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            now = (unsigned long)ts.tv_sec * 1000ul
-                + (unsigned long)ts.tv_nsec / 1000000ul;
+            unsigned long now = now_ms();
+
             if (now - last_sentinel_check >= 2000ul) {
                 last_sentinel_check = now;
                 if (g_inotify_fd >= 0 && g_inotify_data_wd < 0)
@@ -1150,6 +1186,16 @@ int main(int argc, char **argv)
                 nfds += n;
             }
             timeout = 20;
+        }
+
+        if (g_conf_reopen_at) {
+            /* Wake in time for the reopening that is due. */
+            unsigned long now = now_ms();
+            unsigned long left = g_conf_reopen_at > now
+                               ? g_conf_reopen_at - now : 0;
+
+            if (left < (unsigned long)timeout)
+                timeout = (int)left;
         }
 
         err = poll(pfds, (nfds_t)nfds, timeout);

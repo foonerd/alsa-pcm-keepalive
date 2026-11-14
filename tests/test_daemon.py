@@ -55,7 +55,7 @@ class KeepaliveDaemonTest(unittest.TestCase):
             self.daemon.wait(timeout=3)
         self.daemon = None
 
-    def start_daemon(self, partial_writes=False, iec958=False):
+    def start_daemon(self, partial_writes=False, iec958=False, rate=None):
         self.iec958 = iec958
         capture = (
             f'type file slave.pcm {{ type null }} file "{self.output_path}" '
@@ -88,7 +88,7 @@ class KeepaliveDaemonTest(unittest.TestCase):
                 "--pcm", "sink",
                 "--fallback-pcm", "sink",
                 "--socket", str(self.socket_path),
-            ],
+            ] + (["--rate", str(rate)] if rate else []),
             env=env,
             stdout=log,
             stderr=log,
@@ -177,6 +177,33 @@ class KeepaliveDaemonTest(unittest.TestCase):
         self.assertIn("reopen for client", log)
         self.stop_daemon()
         self.assert_samples("S24_3LE")
+
+    def test_the_output_idles_at_the_rate_asked_for_and_a_player_at_that_rate_does_not_reopen_it(self):
+        # A player whose first stream is at the rate the output already idles
+        # at is taken on as the output stands: the device's clocks do not
+        # stop and start for it.
+        self.start_daemon(rate=44100)
+        for _ in range(200):
+            if "opened sink rate=44100" in self.log_path.read_text(encoding="utf-8"):
+                break
+            time.sleep(0.01)
+        self.assertIn("opened sink rate=44100", self.log_path.read_text(encoding="utf-8"))
+        self.play("S16_LE")
+        time.sleep(0.2)
+        log = self.log_path.read_text(encoding="utf-8")
+        self.assertIn("client open rate=44100", log)
+        self.assertNotIn("reopen for client", log)
+        self.stop_daemon()
+
+    def test_a_rate_that_is_not_one_is_refused(self):
+        for bad in ("fast", "0", "999999999", "44100x"):
+            with self.subTest(rate=bad):
+                done = subprocess.run(
+                    [str(ROOT / "audio-keepalive-daemon"), "--rate", bad],
+                    capture_output=True, text=True, timeout=5,
+                )
+                self.assertEqual(done.returncode, 1)
+                self.assertIn("--rate takes", done.stderr)
 
     def test_partial_alsa_writes_are_retried_without_losing_samples(self):
         self.start_daemon(partial_writes=True, iec958=True)

@@ -87,6 +87,13 @@ Start the daemon before any player:
 
     audio-keepalive-daemon --pcm keepaliveProxyOut --fallback-pcm hw:0,0
 
+`--rate HZ` sets the sample rate the output idles at before a player asks
+for one, 48000 unless given. A player whose first stream is 16-bit stereo at
+that rate is taken on without the output being opened again, so the device's
+clocks do not stop and start for it. When `asound.conf` changes, the output
+is opened again once the file has been left alone for two seconds, not at
+once: whatever rewrote it is often still at work on the device.
+
 Then point the player at `keepaliveProxy`.
 
 
